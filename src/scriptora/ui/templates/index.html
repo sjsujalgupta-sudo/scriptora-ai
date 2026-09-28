@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scriptora &middot; Context-aware AI subtitles</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#127908;</text></svg>" />
+</head>
+<body>
+  <div class="app" id="app">
+
+    <header class="masthead">
+      <div class="brand">
+        <h1>SCRIPTORA</h1>
+        <p class="tagline">Context-aware AI subtitles &middot; Powered by AssemblyAI</p>
+      </div>
+      <div class="status-block">
+        <span class="status-dot" id="status-dot" data-state="idle"></span>
+        <span class="status-text" id="status-text">Idle</span>
+      </div>
+    </header>
+
+    {% if not config.api_key_configured %}
+    <div class="banner banner-error" role="alert">
+      <strong>ASSEMBLYAI_API_KEY is not configured.</strong>
+      Copy <code>.env.example</code> to <code>.env</code>, add your key, and restart
+      Scriptora. See the README Setup section.
+    </div>
+    {% endif %}
+
+    <div class="controls">
+      <button id="btn-listen" class="btn btn-primary" disabled>
+        <span class="btn-label">Start Listening</span>
+      </button>
+      <button id="btn-stop" class="btn btn-ghost" disabled>Stop</button>
+      <div class="control-divider"></div>
+      <input
+        id="command-input"
+        class="command-input"
+        type="text"
+        placeholder="Type a command, e.g. Correct the last subtitle"
+        autocomplete="off"
+        disabled
+      />
+      <button id="btn-command" class="btn btn-ghost" disabled>Run</button>
+    </div>
+
+    <div class="waveform-wrap" id="waveform-wrap" hidden>
+      <div class="level-meter"><div class="level-fill" id="level-fill"></div></div>
+      <span class="waveform-label" id="waveform-label">Microphone level</span>
+    </div>
+
+    <main class="grid">
+
+      <section class="panel panel-subtitles">
+        <div class="panel-head">
+          <h2>Live subtitles</h2>
+          <span class="chip" id="subtitle-count">0 lines</span>
+        </div>
+
+        <div class="transcript" id="transcript">
+          <p class="empty-state" id="transcript-empty">
+            Press <strong>Start Listening</strong> and speak. Your words will appear
+            here as AssemblyAI transcribes them.
+          </p>
+        </div>
+
+        <div class="compare" id="compare" hidden>
+          <div class="compare-head">
+            <h3>Last correction</h3>
+            <span class="chip chip-ok" id="compare-backend"></span>
+          </div>
+          <div class="compare-grid">
+            <div class="compare-col">
+              <span class="compare-label">Raw</span>
+              <p class="compare-text compare-raw" id="compare-raw"></p>
+            </div>
+            <div class="compare-arrow" aria-hidden="true">&darr;</div>
+            <div class="compare-col">
+              <span class="compare-label compare-label-fixed">AI corrected</span>
+              <p class="compare-text compare-fixed" id="compare-fixed"></p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Project context</h2>
+            <span class="chip" id="term-count">0</span>
+          </div>
+          <p class="panel-note">
+            Vocabulary steers AssemblyAI's transcription <em>and</em> the correction
+            engine.
+          </p>
+          <ul class="vocab" id="vocab"></ul>
+          <form class="vocab-add" id="vocab-form">
+            <input
+              id="vocab-input"
+              type="text"
+              placeholder="Add a term"
+              autocomplete="off"
+              disabled
+            />
+            <button class="btn btn-ghost btn-small" id="btn-add-term" type="submit" disabled>Add</button>
+          </form>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Activity</h2>
+            <button class="link-btn" id="btn-clear-log" type="button">Clear</button>
+          </div>
+          <ul class="activity" id="activity">
+            <li class="activity-item activity-muted">Waiting...</li>
+          </ul>
+        </section>
+
+        <section class="panel panel-commands">
+          <div class="panel-head"><h2>Voice commands</h2></div>
+          <ul class="commands">
+            <li><code>Correct the last subtitle</code></li>
+            <li><code>Fix the previous subtitle</code></li>
+            <li><code>Change fast API to FastAPI</code></li>
+            <li><code>Replace Alice with Atlas</code></li>
+            <li><code>Remember FastAPI as a technical term</code></li>
+          </ul>
+        </section>
+
+        <section class="panel panel-meta">
+          <dl class="meta">
+            <div><dt>Speech model</dt><dd>{{ config.speech_model }}</dd></div>
+            <div><dt>Corrector</dt><dd id="meta-corrector">...</dd></div>
+            <div><dt>Sample rate</dt><dd>{{ config.sample_rate }} Hz</dd></div>
+            <div><dt>API key</dt><dd id="meta-key">...</dd></div>
+          </dl>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script>
+    window.SCRIPTORA_CONFIG = {{ config | tojson }};
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
