@@ -159,7 +159,7 @@ class LLMCorrector:
         """
         return subtitle.id
 
-    def correct_subtitle(
+    async def correct_subtitle(
         self,
         subtitle: Subtitle,
         command: ParsedCommand,
@@ -178,11 +178,11 @@ class LLMCorrector:
                 },
             ],
         }
-        raw = self._complete(body)
+        raw = await self._complete(body)
         parsed = SubtitleCorrection.model_validate(extract_json_object(raw))
         return parsed
 
-    def vocabulary_term(
+    async def vocabulary_term(
         self, command: ParsedCommand, context: ContextService
     ) -> VocabularyAddition:
         body = {
@@ -203,15 +203,23 @@ class LLMCorrector:
                 },
             ],
         }
-        raw = self._complete(body)
+        raw = await self._complete(body)
         return VocabularyAddition.model_validate(extract_json_object(raw))
 
-    def _complete(self, body: dict) -> str:
+    async def _complete(self, body: dict) -> str:
         headers = {"authorization": self._settings.require_api_key()}
         try:
-            response = httpx.post(
-                LLM_GATEWAY_URL, headers=headers, json=body, timeout=self._timeout
-            )
+            # A client per call rather than a shared one: corrections are rare,
+            # user-initiated events, so the connection setup is not worth
+            # optimising, and it leaves no client to leak, close or rebind when
+            # several sessions are running side by side. The previous
+            # `httpx.post` was synchronous, so a slow gateway blocked the event
+            # loop - and with it the audio stream to AssemblyAI - for as long as
+            # the request took.
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    LLM_GATEWAY_URL, headers=headers, json=body, timeout=self._timeout
+                )
         except httpx.HTTPError as exc:
             raise RuntimeError(f"LLM gateway unreachable: {type(exc).__name__}") from exc
 
@@ -294,8 +302,13 @@ class CorrectionService:
             vocabulary_term=canonical,
         )
 
-    def correct(self, command: ParsedCommand) -> CorrectionResult:
-        """Apply a correction command."""
+    async def correct(self, command: ParsedCommand) -> CorrectionResult:
+        """Apply a correction command.
+
+        Async because it may consult the LLM gateway. Callers on the async
+        session path must await it, so a slow gateway suspends only this
+        command instead of blocking the event loop.
+        """
         if command.kind is CommandKind.REMEMBER:
             return self.remember(command)
 
@@ -328,13 +341,12 @@ class CorrectionService:
         #    A literal "change X to Y" is skipped entirely: the deterministic
         #    path already performs it exactly, and the model is instructed to
         #    apply exactly that edit too, so its answer could only ever be
-        #    discarded. That is worth more than the saved round-trip, because
-        #    the gateway call is synchronous - on a slow or unreachable gateway
-        #    it blocks the event loop, which stalls audio streaming to
-        #    AssemblyAI for the whole session. This is the most common command
-        #    in the demo, so it must not pay dead latency.
+        #    discarded. The gateway call is now non-blocking, so this saves a
+        #    pointless round trip and its latency rather than protecting the
+        #    event loop - but it is still the most common command in the demo,
+        #    and a request that cannot change the result is pure latency.
         if self._llm is not None and command.kind is not CommandKind.REPLACE:
-            proposal = self._try_llm(target, command)
+            proposal = await self._try_llm(target, command)
 
             if proposal is not None and proposal.is_valid_for(self._subtitles.known_ids()):
                 proposed_text = proposal.replacement_text.strip()
@@ -379,7 +391,7 @@ class CorrectionService:
             reason=reason,
         )
 
-    def _try_llm(self, target: Subtitle, command: ParsedCommand) -> SubtitleCorrection | None:
+    async def _try_llm(self, target: Subtitle, command: ParsedCommand) -> SubtitleCorrection | None:
         """Ask the LLM for a correction, returning None on any problem.
 
         Never raises: an unreachable gateway, a non-200, unparseable JSON, a
@@ -388,7 +400,7 @@ class CorrectionService:
         """
         assert self._llm is not None
         try:
-            return self._llm.correct_subtitle(target, command, self._context, self._subtitles)
+            return await self._llm.correct_subtitle(target, command, self._context, self._subtitles)
         except Exception as exc:
             logger.info("LLM correction unavailable (%s); using rules", type(exc).__name__)
             return None

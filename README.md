@@ -119,9 +119,11 @@ mic ──▶ ScriptProcessorNode ──▶ 16 kHz mono s16le ──▶ 100 ms f
   labelled `rules`, not `llm`.
 - **A literal edit never calls the model.** "Change X to Y" is already
   implemented exactly by the deterministic path, so the gateway is skipped
-  entirely. That is not just an optimisation: the gateway call is synchronous,
-  so paying for a discarded answer would stall audio streaming for the whole
-  session whenever the gateway is slow.
+  entirely and the edit is applied without a network round trip.
+- **The model is consulted off the event loop.** LLM-backed corrections use
+  `httpx.AsyncClient`, so a slow or unreachable gateway suspends only the
+  pending correction. Audio keeps streaming to AssemblyAI while the request is
+  outstanding, and a gateway failure falls back to the rules as before.
 - **Vocabulary is pushed to AssemblyAI.** Remembering a term calls
   `set_params` on the *live* session, so the very next sentence is transcribed
   with the term in `keyterms_prompt`. This is the part that changes

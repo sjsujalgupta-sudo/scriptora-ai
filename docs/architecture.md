@@ -135,16 +135,36 @@ already have. The gateway is therefore not called for `REPLACE` at all.
 This was originally implemented the other way round: the model was asked, and
 its answer was then discarded in favour of the rules, with a log line
 ("Keeping literal replace over LLM rewrite") explaining the discard. That cost
-a synchronous HTTP round-trip to learn nothing.
+an HTTP round-trip to learn nothing.
 
-That mattered more than it looks. `LLMCorrector._complete` is a blocking
-`httpx.post`, called from the async session, so it stalls the event loop — and
-therefore audio streaming to AssemblyAI — for as long as it takes. Against the
-configured 25 s timeout, a slow or unreachable gateway froze transcription for
-the whole session. `REPLACE` is the command the demo script uses in step 2, so
-the most-used command was the one paying the most for nothing. It now costs no
+`REPLACE` is the command the demo script uses in step 2, so the most-used
+command was paying for an answer that could not be applied. It now costs no
 network call at all; `tests/test_correction_service.py` asserts the call count
 is zero, so the regression cannot come back quietly.
+
+#### The gateway is never called from the event loop
+
+`_complete` used to be a blocking `httpx.post` invoked from the async session,
+so it held the event loop — and therefore audio streaming to AssemblyAI — for
+as long as the request took. Against the 25 s timeout, a slow or unreachable
+gateway froze transcription for the whole session.
+
+It is now `httpx.AsyncClient`, and the whole chain is awaited:
+`LLMCorrector._complete` → `correct_subtitle` → `CorrectionService._try_llm` →
+`CorrectionService.correct` → the session. A pending request suspends only that
+correction; the audio pump and the websocket keep running. The timeout, the
+error handling and the fallback are unchanged — a gateway failure still
+collapses to the deterministic result labelled `rules`.
+
+A client is created per call rather than shared. Corrections are rare,
+user-initiated events, so the connection setup is not worth optimising, and it
+avoids a long-lived pool that would have to be closed on session teardown.
+
+The behavioural test cannot detect a *reintroduced* blocking call: a thread
+stuck inside one cannot be woken by any asyncio construct, so the test would
+hang rather than fail. Two structural guards cover that case instead — the
+coroutine identity of each frame in the chain, and an AST check that no
+`httpx.post` call remains in the module.
 
 ### The target subtitle is resolved in the app, not the model
 
@@ -242,12 +262,11 @@ awaited — rather than tests that only assert our own calls happened.
   Kubernete" and the transcript says "Remember Kubernetes", Scriptora stores
   `Kubernetes`. Use "Change … to …" first when you need to fix a term's
   spelling, then remember it.
-- **The LLM backend is best-effort and slow to fail.** A gateway timeout is a
-  25 s pause on the event loop, because the corrector is synchronous. The
-  deterministic path is unaffected, which is why it runs first. This now only
-  applies to commands that genuinely need the model: literal edits skip the
-  gateway entirely, so `change X to Y` stays instant even on a bad network.
-  Making the remaining `correct the last subtitle` path non-blocking (async
-  `httpx`, or a worker thread) is the obvious next step.
+- **The LLM backend is best-effort and slow to answer.** A slow gateway delays
+  the correction by up to the 25 s timeout, but it no longer blocks anything
+  else: the request is awaited, so audio keeps streaming to AssemblyAI while it
+  is outstanding. The deterministic path is unaffected, which is why it runs
+  first, and a gateway failure still falls back to it. Commands that can be
+  answered without the model — literal edits — never wait at all.
 - **The command grammar is narrow by design**, so novel phrasings fall through
   to "unsupported" instead of being guessed at.

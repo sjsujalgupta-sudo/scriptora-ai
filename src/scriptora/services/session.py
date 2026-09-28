@@ -238,7 +238,7 @@ class ScriptoraSession:
     async def handle_command(self, raw: str) -> CorrectionResult:
         """Run a spoken (or typed) command. Always returns a result."""
         command = parse_command(raw)
-        result = self.corrections.correct(command)
+        result = await self.corrections.correct(command)
         await self._publish_result(command, result)
         return result
 
@@ -267,7 +267,7 @@ class ScriptoraSession:
                 payload={"reason": "voice_command"},
             )
 
-        result = self.corrections.correct(command)
+        result = await self.corrections.correct(command)
         await self._publish_result(command, result)
 
     async def _publish_result(self, command: ParsedCommand, result: CorrectionResult) -> None:

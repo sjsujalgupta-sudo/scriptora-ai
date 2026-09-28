@@ -7,12 +7,15 @@ error handling are exercised without any network access.
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from scriptora.config import Settings
 from scriptora.main import create_app
+from scriptora.models.correction import CorrectionOutcome
 from scriptora.models.events import EventType
 from scriptora.services.session import ScriptoraSession
 
@@ -377,3 +380,98 @@ async def asyncio_sleep():
     import asyncio
 
     await asyncio.sleep(0.01)
+
+
+# ============================================ correction through the async path
+def _gateway_says(subtitle_id: str, replacement: str) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"action": "correct_subtitle", "target_subtitle_id": "'
+                            + subtitle_id
+                            + '", "replacement_text": "'
+                            + replacement
+                            + '", "vocabulary_term": null, "reason": "canonical spelling"}'
+                        )
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        },
+    )
+
+
+async def test_a_typed_command_still_corrects_the_intended_subtitle(stub):
+    """The HTTP command route must survive the async conversion intact.
+
+    `handle_command` is the path the /command endpoint awaits, so this covers
+    the real entry point rather than the service in isolation: the awaited
+    correction still lands on the intended subtitle, and the UI still receives
+    exactly one correction event carrying the same fields as before.
+    """
+    session, events = make_session()
+    await session.start()
+    sub = session.subtitles.add("we use fast api here")
+    sub.finalize()
+
+    with patch(
+        "httpx.AsyncClient.post", return_value=_gateway_says(sub.id, "we use FastAPI here")
+    ) as post:
+        result = await session.handle_command("Correct the last subtitle")
+
+    assert post.call_count == 1
+    assert result.outcome is CorrectionOutcome.APPLIED
+    assert result.backend == "llm"
+    assert result.subtitle_id == sub.id
+    assert session.subtitles.get(sub.id).text == "we use FastAPI here"
+
+    corrections = events_of(events, EventType.CORRECTION)
+    assert len(corrections) == 1
+    assert corrections[0]["payload"]["outcome"] == "applied"
+    assert corrections[0]["payload"]["backend"] == "llm"
+    assert corrections[0]["payload"]["subtitle_id"] == sub.id
+
+
+async def test_a_spoken_command_does_not_block_audio_forwarding_while_pending(stub):
+    """A pending LLM answer must not stop audio reaching AssemblyAI.
+
+    The gateway parks until the test releases it, so the overlap between an
+    in-flight correction and a forwarded audio frame is a fact, not a race. If
+    the correction blocked the loop, the frame could not be delivered until the
+    gateway replied - and the gateway never replies until released.
+    """
+    import asyncio
+
+    session, _ = make_session()
+    await session.start()
+    sub = session.subtitles.add("we use fast api here")
+    sub.finalize()
+
+    request_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def parked_post(*_args, **_kwargs):
+        request_started.set()
+        await release.wait()
+        return _gateway_says(sub.id, "we use FastAPI here")
+
+    with patch("httpx.AsyncClient.post", new=parked_post):
+        pending = asyncio.create_task(session.handle_command("Correct the last subtitle"))
+        await asyncio.wait_for(request_started.wait(), timeout=5)
+
+        # Audio keeps flowing while the correction is still outstanding.
+        # One whole frame: 100 ms of 16 kHz mono s16le = 3200 bytes.
+        await asyncio.wait_for(session.send_audio(b"\x01\x02" * 1600), timeout=5)
+        await asyncio_sleep()
+        assert stub.last.streams, "no audio reached AssemblyAI while the LLM was pending"
+        assert not pending.done(), "correction completed before the gateway replied"
+
+        release.set()
+        result = await asyncio.wait_for(pending, timeout=5)
+
+    assert result.outcome is CorrectionOutcome.APPLIED
+    assert session.subtitles.get(sub.id).text == "we use FastAPI here"
