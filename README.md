@@ -79,11 +79,10 @@ Everything is optional except the key.
 | `SCRIPTORA_HOST` | `127.0.0.1` | Bind address. |
 | `SCRIPTORA_PORT` | `8000` | Port. |
 | `SCRIPTORA_SPEECH_MODEL` | `universal-3-5-pro` | AssemblyAI realtime model. |
-| `SCRIPTORA_STREAM_MODE` | `balanced` | `latency` / `balanced` / `accuracy`. |
+| `SCRIPTORA_STREAM_MODE` | `balanced` | `min_latency` / `balanced` / `max_accuracy`. Anything else falls back to `balanced`. |
 | `SCRIPTORA_CORRECTOR_BACKEND` | `auto` | `auto`, `llm`, or `rules`. |
 | `SCRIPTORA_LLM_MODEL` | `qwen3.5-4b-32k-fast` | Gateway model. |
-| `SCRIPTORA_LLM_BASE_URL` | `https://llm-gateway.assemblyai.com/v1` | Gateway base. |
-| `SCRIPTORA_LOG_LEVEL` | `INFO` | Logging verbosity. |
+| `SCRIPTORA_FRAME_DURATION_MS` | `100` | Audio frame size sent to AssemblyAI. Clamped to 50-1000, which is what the API accepts. |
 
 The key is read from the environment or a `.env` file, which is git-ignored.
 It is never sent to the browser; `/api/health` only reports whether one is set.
@@ -91,14 +90,14 @@ It is never sent to the browser; `/api/health` only reports whether one is set.
 ## How it works
 
 ```
-mic ──▶ AudioWorklet ──▶ 16 kHz mono s16le ──▶ 100 ms frames (3200 B)
-                                                    │
-                                          WebSocket (binary)
-                                                    ▼
-                                        FastAPI  /ws/audio
-                                                    │
-                                     per-connection ScriptoraSession
-                                                    ▼
+mic ──▶ ScriptProcessorNode ──▶ 16 kHz mono s16le ──▶ 100 ms frames (3200 B)
+                                                     │
+                                           WebSocket (binary)
+                                                     ▼
+                                         FastAPI  /ws/audio
+                                                     │
+                                      per-connection ScriptoraSession
+                                                     ▼
                             AssemblyAI Realtime v3  (universal-3-5-pro)
                                           │              │
                         final turn ───────┘              └──── keyterms_prompt
@@ -114,9 +113,15 @@ mic ──▶ AudioWorklet ──▶ 16 kHz mono s16le ──▶ 100 ms frames (
 ```
 
 - **Rules first.** A deterministic corrector always runs and always produces a
-  safe answer. The LLM is only adopted when its output parses, validates
-  against the known subtitle IDs, and is actually different. Otherwise the
-  rules win and the result is labelled `rules`, not `llm`.
+  safe answer. The LLM is only consulted when it could change the outcome, and
+  is adopted only when its output parses, validates against the known subtitle
+  IDs, and is actually different. Otherwise the rules win and the result is
+  labelled `rules`, not `llm`.
+- **A literal edit never calls the model.** "Change X to Y" is already
+  implemented exactly by the deterministic path, so the gateway is skipped
+  entirely. That is not just an optimisation: the gateway call is synchronous,
+  so paying for a discarded answer would stall audio streaming for the whole
+  session whenever the gateway is slow.
 - **Vocabulary is pushed to AssemblyAI.** Remembering a term calls
   `set_params` on the *live* session, so the very next sentence is transcribed
   with the term in `keyterms_prompt`. This is the part that changes
@@ -142,7 +147,7 @@ against the real API; see `docs/architecture.md` for what that found.
 ## Tech stack
 
 Python 3.11+ · FastAPI · AssemblyAI Realtime v3 · Pydantic v2 · Jinja2 ·
-vanilla JS + AudioWorklet · WebSocket binary frames
+vanilla JS + ScriptProcessorNode · WebSocket binary frames
 
 ## Licence
 

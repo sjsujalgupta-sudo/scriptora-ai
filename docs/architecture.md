@@ -13,11 +13,11 @@ getUserMedia
 AudioContext (16 kHz target)        
   │                                
   ▼                                
-AudioWorklet                       
+ScriptProcessorNode
   │  Float32 → Int16 PCM            
   ▼                                
-ScriptProcessor (4096 B blocks)     
-  │  3200 B = 100 ms frames         
+frame slicer
+  │  3200 B = 100 ms frames
   ▼                                
 WebSocket /ws/audio  ──binary──▶  ScriptoraSession
                                        │
@@ -125,6 +125,27 @@ If the model produced the text that got applied, `backend` becomes `"llm"`.
 Vocabulary edits report `"context"` and rejected commands report `"rules"`,
 because claiming the AI did the work would make the activity log a lie.
 
+#### Literal edits skip the model entirely
+
+A `change X to Y` is a fully specified edit, and the deterministic path already
+performs it exactly — the system prompt tells the model to apply "exactly that
+edit" too, so there is no outcome the model could produce that the rules do not
+already have. The gateway is therefore not called for `REPLACE` at all.
+
+This was originally implemented the other way round: the model was asked, and
+its answer was then discarded in favour of the rules, with a log line
+("Keeping literal replace over LLM rewrite") explaining the discard. That cost
+a synchronous HTTP round-trip to learn nothing.
+
+That mattered more than it looks. `LLMCorrector._complete` is a blocking
+`httpx.post`, called from the async session, so it stalls the event loop — and
+therefore audio streaming to AssemblyAI — for as long as it takes. Against the
+configured 25 s timeout, a slow or unreachable gateway froze transcription for
+the whole session. `REPLACE` is the command the demo script uses in step 2, so
+the most-used command was the one paying the most for nothing. It now costs no
+network call at all; `tests/test_correction_service.py` asserts the call count
+is zero, so the regression cannot come back quietly.
+
 ### The target subtitle is resolved in the app, not the model
 
 "Last" and "previous" are positional. The model is given the resolved subtitle
@@ -223,6 +244,10 @@ awaited — rather than tests that only assert our own calls happened.
   spelling, then remember it.
 - **The LLM backend is best-effort and slow to fail.** A gateway timeout is a
   25 s pause on the event loop, because the corrector is synchronous. The
-  deterministic path is unaffected, which is why it runs first.
+  deterministic path is unaffected, which is why it runs first. This now only
+  applies to commands that genuinely need the model: literal edits skip the
+  gateway entirely, so `change X to Y` stays instant even on a bad network.
+  Making the remaining `correct the last subtitle` path non-blocking (async
+  `httpx`, or a worker thread) is the obvious next step.
 - **The command grammar is narrow by design**, so novel phrasings fall through
   to "unsupported" instead of being guessed at.

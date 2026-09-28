@@ -320,21 +320,26 @@ class CorrectionService:
         backend = self._rules.name
         reason = command.reason
 
-        # 2. Try the LLM, but only adopt its answer if it validates. `backend`
-        #    is only upgraded to "llm" when the model actually produced the
-        #    text that gets applied, so the UI never misattributes a result.
-        if self._llm is not None:
+        # 2. Try the LLM, but only for commands where it could change the
+        #    outcome, and adopt its answer only if it validates. `backend` is
+        #    upgraded to "llm" only when the model actually produced the text
+        #    that gets applied, so the UI never misattributes a result.
+        #
+        #    A literal "change X to Y" is skipped entirely: the deterministic
+        #    path already performs it exactly, and the model is instructed to
+        #    apply exactly that edit too, so its answer could only ever be
+        #    discarded. That is worth more than the saved round-trip, because
+        #    the gateway call is synchronous - on a slow or unreachable gateway
+        #    it blocks the event loop, which stalls audio streaming to
+        #    AssemblyAI for the whole session. This is the most common command
+        #    in the demo, so it must not pay dead latency.
+        if self._llm is not None and command.kind is not CommandKind.REPLACE:
             proposal = self._try_llm(target, command)
 
             if proposal is not None and proposal.is_valid_for(self._subtitles.known_ids()):
                 proposed_text = proposal.replacement_text.strip()
 
-                if command.kind is CommandKind.REPLACE:
-                    # The user asked for a literal edit; the deterministic
-                    # result already implements it exactly. Keep that.
-                    if proposed_text != fallback.strip():
-                        logger.info("Keeping literal replace over LLM rewrite")
-                elif proposed_text != target.text.strip():
+                if proposed_text != target.text.strip():
                     # Normalise vocabulary on top of the model's own answer.
                     fallback = self._context.restore_terms(proposed_text)
                     backend = self._llm.name

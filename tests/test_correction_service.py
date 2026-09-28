@@ -339,7 +339,13 @@ def test_llm_malformed_envelope_falls_back_to_rules(context_with_fastapi):
 
 
 def test_explicit_replace_wins_over_llm_rewrite(context_with_fastapi):
-    """A literal user instruction must not be overridden by the model."""
+    """A literal user instruction must not be overridden by the model.
+
+    The model is not consulted at all: the deterministic path implements a
+    literal edit exactly, so the gateway call could only produce an answer that
+    gets discarded. Asserting the call count is the point of the test - it is
+    the regression guard against paying (and blocking on) a dead round-trip.
+    """
     subtitles = SubtitleService()
     context = context_with_fastapi
     service = build(subtitles, context, backend="llm")
@@ -350,10 +356,57 @@ def test_explicit_replace_wins_over_llm_rewrite(context_with_fastapi):
         '{"action": "correct_subtitle", "target_subtitle_id": "' + sub.id + '", '
         '"replacement_text": "We work with Bob and the team.", "reason": "x"}'
     )
-    with patch("httpx.post", return_value=_llm_response(llm_says)):
-        service.correct(parse_command("Replace Alice with Atlas."))
+    with patch("httpx.post", return_value=_llm_response(llm_says)) as post:
+        result = service.correct(parse_command("Replace Alice with Atlas."))
 
     assert subtitles.get(sub.id).text == "We work with Atlas."
+    # No HTTP call: the answer could not have changed the outcome.
+    assert post.call_count == 0
+    # And it is never misattributed to the model.
+    assert result.backend == "rules"
+
+
+def test_replace_skips_the_llm_even_when_the_edit_is_impossible(context_with_fastapi):
+    """A replace whose target text is absent still costs no gateway call.
+
+    The literal edit produced nothing, so the result is a no_action - the same
+    outcome the previous code produced after paying for a discarded answer.
+    """
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi, backend="llm")
+    sub = subtitles.add("Nothing relevant here.")
+    sub.finalize()
+
+    llm_says = (
+        '{"action": "correct_subtitle", "target_subtitle_id": "' + sub.id + '", '
+        '"replacement_text": "Invented rewrite.", "reason": "x"}'
+    )
+    with patch("httpx.post", return_value=_llm_response(llm_says)) as post:
+        result = service.correct(parse_command("Replace missing with present."))
+
+    assert post.call_count == 0
+    assert result.outcome is CorrectionOutcome.NO_ACTION
+    assert subtitles.get(sub.id).text == "Nothing relevant here."
+
+
+def test_correction_commands_still_consult_the_llm(context_with_fastapi):
+    """The short-circuit must not disable the model for real corrections."""
+    subtitles = SubtitleService()
+    context = context_with_fastapi
+    service = build(subtitles, context, backend="llm")
+    sub = subtitles.add("we use fast api here")
+    sub.finalize()
+
+    llm_says = (
+        '{"action": "correct_subtitle", "target_subtitle_id": "' + sub.id + '", '
+        '"replacement_text": "we use FastAPI here", "reason": "canonical spelling"}'
+    )
+    with patch("httpx.post", return_value=_llm_response(llm_says)) as post:
+        result = service.correct(parse_command("Correct the last subtitle"))
+
+    assert post.call_count == 1
+    assert result.backend == "llm"
+    assert subtitles.get(sub.id).text == "we use FastAPI here"
 
 
 def test_no_api_key_disables_the_llm_backend(context_with_fastapi):
