@@ -166,10 +166,16 @@ keeps rendering a line the server has deleted.
 
 "Correct the last subtitle. It's FastAPI." carries the answer. The parser
 extracts it (`_named_term`) and the rules canonicalise loose spellings of it.
-This means the primary demo works *before* the term has been remembered, which
-is the order a user actually tries it in. Extraction is bounded by length,
-word count, and a vague-pronoun list, so "it should be the name of the
-framework" is rejected rather than treated as a term.
+This means a correction works *before* the term has been remembered, which is
+the order a user actually tries it in. Extraction is bounded by length, word
+count, and a vague-pronoun list, so "it should be the name of the framework"
+is rejected rather than treated as a term.
+
+The substitution is word-anchored, so it only repairs differences of spacing
+and case — `fast API` → `FastAPI`, `quill base` → `Quillbase`. It cannot rewrite
+a *different* word: `Kubernete` is a prefix of `Kubernetes`, so the anchor
+blocks the match and the result is `no_action`. For a genuinely different
+spelling, `Change X to Y` is the command that works.
 
 ### Audio in the browser
 

@@ -8,13 +8,20 @@ about it. Teach Scriptora a project term once, and it remembers it — both when
 correcting text and when transcribing your next sentence.
 
 ```
-you  ->  "we're deploying on Kubernete clusters tonight"
-ui   ->  1. we're deploying on Kubernetes clusters tonight
-you  ->  "correct the last subtitle, it's Kubernete"
-ui   ->  1. we're deploying on Kubernete clusters tonight     [corrected]
-you  ->  "remember Kubernete as a technical term"
+you  ->  "it runs on Kubernete clusters"
+ui   ->  1. it runs on Kubernetes clusters
+you  ->  "Change Kubernetes to Kubernete."
+ui   ->  1. it runs on Kubernete clusters               [corrected]
+you  ->  "Add Kubernete to the vocabulary"
 ui   ->  project context: AssemblyAI, Python, Atlas, PostgreSQL, Kubernete
+                              AssemblyAI keyterms updated with "Kubernete"
+you  ->  "it runs on Kubernete clusters"
+ui   ->  2. it runs on Kubernete clusters               [heard correctly now]
 ```
+
+The last line is the point: the term reached AssemblyAI's live
+`keyterms_prompt`, so the model now *hears* your project the way you say it
+instead of normalising it to a word it already knows.
 
 ## Why this exists
 
@@ -60,7 +67,7 @@ python -m scriptora.main
 # or, once installed:  scriptora
 ```
 
-Open <http://127.0.0.1:8000>, press **Start**, allow microphone access, and talk.
+Open <http://127.0.0.1:8000>, press **Start Listening**, allow microphone access, and talk.
 
 ### Configuration
 
