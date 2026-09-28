@@ -71,3 +71,9 @@ def run() -> None:
         port=settings.port,
         log_level="info",
     )
+
+
+# `python -m scriptora.main` is the documented start command, so it has to
+# serve. Without this guard the module only built `app` and exited.
+if __name__ == "__main__":
+    run()
