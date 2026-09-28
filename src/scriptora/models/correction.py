@@ -124,7 +124,10 @@ class CorrectionResult(BaseModel):
     message: str
     backend: str = "unknown"
     action: CorrectionAction = CorrectionAction.NO_ACTION
+    # The line that was targeted. The original stays in the transcript.
     subtitle_id: str | None = None
+    # The inserted child line holding the corrected wording, when one was added.
+    corrected_subtitle_id: str | None = None
     before: str | None = None
     after: str | None = None
     vocabulary_term: str | None = None
@@ -132,6 +135,21 @@ class CorrectionResult(BaseModel):
 
     @classmethod
     def failure(
-        cls, outcome: CorrectionOutcome, message: str, *, backend: str, reason: str = ""
+        cls,
+        outcome: CorrectionOutcome,
+        message: str,
+        *,
+        backend: str,
+        reason: str = "",
+        subtitle_id: str | None = None,
     ) -> CorrectionResult:
-        return cls(outcome=outcome, message=message, backend=backend, reason=reason)
+        # `subtitle_id` is accepted so a refusal can still name the line it was
+        # about - "still being corrected" is only actionable if the UI can
+        # highlight which line is busy.
+        return cls(
+            outcome=outcome,
+            message=message,
+            backend=backend,
+            reason=reason,
+            subtitle_id=subtitle_id,
+        )

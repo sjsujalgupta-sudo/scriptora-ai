@@ -7,6 +7,7 @@ socket, one port, no separate service.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from contextlib import suppress
@@ -15,7 +16,6 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from ..config import Settings
-from ..models.correction import CorrectionResult
 from ..services.session import ScriptoraSession
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,10 @@ async def audio_socket(websocket: WebSocket) -> None:
 
     session = ScriptoraSession(settings, send)
 
+    # Corrections running in the background while the socket is open. Drained on
+    # the way out so a correction in flight is not abandoned mid-write.
+    background: set = set()
+
     try:
         await _send_json(
             websocket,
@@ -89,7 +93,7 @@ async def audio_socket(websocket: WebSocket) -> None:
                 continue
 
             if (text := message.get("text")) is not None:
-                await _handle_control(session, text)
+                await _handle_control(session, text, background)
 
     except WebSocketDisconnect:
         pass
@@ -105,11 +109,25 @@ async def audio_socket(websocket: WebSocket) -> None:
                 },
             )
     finally:
+        # Let corrections finish before tearing the session down, so their
+        # result events still reach the browser. `stop` has already been
+        # delivered by then, because it is handled inline.
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
         await session.stop()
 
 
-async def _handle_control(session: ScriptoraSession, raw: str) -> None:
-    """Handle a text control frame from the browser."""
+async def _handle_control(session: ScriptoraSession, raw: str, background: set) -> None:
+    """Handle a text control frame from the browser.
+
+    `background` collects tasks that must not be awaited inline. Only the
+    correction command goes there: it can spend seconds inside the LLM gateway,
+    and this function runs on the same receive loop that drains the browser's
+    audio frames. Awaiting it here would stall audio forwarding for the whole
+    round trip, which the bounded queue downstream would then absorb as drops.
+    Everything else - start, stop, add_term, clear - stays synchronous, so
+    ordering between those actions is unchanged.
+    """
     try:
         message = json.loads(raw)
     except json.JSONDecodeError:
@@ -127,8 +145,9 @@ async def _handle_control(session: ScriptoraSession, raw: str) -> None:
         if not command:
             await session.emit_error("No command text was provided.")
             return
-        result: CorrectionResult = await session.handle_command(command)
-        logger.info("Command %r -> %s via %s", command, result.outcome.value, result.backend)
+        task = asyncio.create_task(session.handle_command(command))
+        background.add(task)
+        task.add_done_callback(background.discard)
     elif action == "add_term":
         term = (message.get("term") or "").strip()
         if not term:

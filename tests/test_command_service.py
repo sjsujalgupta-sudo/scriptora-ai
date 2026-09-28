@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import pytest
 
-from scriptora.services.command_service import CommandKind, parse_command
+from scriptora.services.command_service import (
+    CommandKind,
+    CorrectionTarget,
+    parse_command,
+)
+from scriptora.services.context_service import ContextService
 
 
 @pytest.mark.parametrize(
@@ -81,6 +86,47 @@ def test_remember_strips_trailing_as_clause():
 
 
 @pytest.mark.parametrize(
+    "phrase,term",
+    [
+        ("Add Kubernete to the vocabulary", "Kubernete"),
+        # Case is the speaker's to choose; the tail strip must not alter it.
+        ("add kubernete to the vocabulary", "kubernete"),
+        ("Add Kubernete to the vocabulary.", "Kubernete"),
+        ("Add Atlas to the context", "Atlas"),
+        ("Add Redis to the project", "Redis"),
+        ("Remember Kubernete", "Kubernete"),
+    ],
+)
+def test_remember_strips_the_phrase_tail_not_the_term(phrase, term):
+    """The 'to the vocabulary' tail is phrasing, never part of the term.
+
+    This is the demo's vocabulary step, and a leaked tail would be pushed
+    straight to AssemblyAI as a keyterm.
+    """
+    parsed = parse_command(phrase)
+    assert parsed.kind is CommandKind.REMEMBER
+    assert parsed.find == term
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Add Kubernete to the vocabulary",
+        "Remember FastAPI as a technical term.",
+        "Add Atlas to the context",
+        "Remember Kubernete",
+    ],
+)
+def test_parser_agrees_with_the_context_service(phrase):
+    """`command.find` is the fallback when the context parser misses.
+
+    If the two disagree the user silently gets a malformed term, so pin them
+    together for every phrasing the demo and docs advertise.
+    """
+    assert parse_command(phrase).find == ContextService().parse_remember_command(phrase)
+
+
+@pytest.mark.parametrize(
     "phrase",
     [
         "",
@@ -129,3 +175,218 @@ def test_parse_never_raises_on_junk():
     for junk in [None, "\x00", "%%%", "a" * 5000]:
         parsed = parse_command(junk)  # type: ignore[arg-type]
         assert parsed.kind is CommandKind.UNSUPPORTED
+
+
+# ====================================================== natural set-text
+#
+# "Change <which line> to <text>" is the feature the demo hangs on, so the
+# accepted phrasings are pinned exhaustively. Every case here must resolve to
+# the *same* target the user meant; a new synonym that silently resolves to
+# nothing is worse than a rejection.
+@pytest.mark.parametrize(
+    "phrase,target,ordinal",
+    [
+        ('Change this to "To deployed."', CorrectionTarget.THIS, None),
+        ("Change this sentence to To deployed.", CorrectionTarget.THIS, None),
+        ("Change that to To deployed.", CorrectionTarget.THIS, None),
+        ("Change the last sentence to To deployed.", CorrectionTarget.LAST, None),
+        ("Change this subtitle to To deployed.", CorrectionTarget.THIS, None),
+        ("Change the last subtitle to To deployed.", CorrectionTarget.LAST, None),
+        ("Change the last line to To deployed.", CorrectionTarget.LAST, None),
+        ("Change the last caption to To deployed.", CorrectionTarget.LAST, None),
+        ("Change the last one to To deployed.", CorrectionTarget.LAST, None),
+        ("Change the last but one to To deployed.", CorrectionTarget.PREVIOUS, None),
+        ("Change the previous sentence to To deployed.", CorrectionTarget.PREVIOUS, None),
+        ("Change the previous subtitle to To deployed.", CorrectionTarget.PREVIOUS, None),
+        ("Change the prior line to To deployed.", CorrectionTarget.PREVIOUS, None),
+        ("Change the preceding caption to To deployed.", CorrectionTarget.PREVIOUS, None),
+        ("Change sentence 3 to To deployed.", CorrectionTarget.ORDINAL, 3),
+        ("Change subtitle 3 to To deployed.", CorrectionTarget.ORDINAL, 3),
+        ("Change line 12 to To deployed.", CorrectionTarget.ORDINAL, 12),
+        ("Change the 3rd sentence to To deployed.", CorrectionTarget.ORDINAL, 3),
+        ("Change the 3rd subtitle to To deployed.", CorrectionTarget.ORDINAL, 3),
+        ("Change the 22nd line to To deployed.", CorrectionTarget.ORDINAL, 22),
+        ("Change the first sentence to To deployed.", CorrectionTarget.ORDINAL, 1),
+        ("Change the second sentence to To deployed.", CorrectionTarget.ORDINAL, 2),
+        ("Change the third sentence to To deployed.", CorrectionTarget.ORDINAL, 3),
+        ("Change the tenth sentence to To deployed.", CorrectionTarget.ORDINAL, 10),
+        ("Change the twentieth line to To deployed.", CorrectionTarget.ORDINAL, 20),
+        ("Replace the last sentence with To deployed.", CorrectionTarget.LAST, None),
+        ("Replace sentence 3 with To deployed.", CorrectionTarget.ORDINAL, 3),
+        ("Rewrite the third sentence to To deployed.", CorrectionTarget.ORDINAL, 3),
+        ("Make the last sentence To deployed.", CorrectionTarget.LAST, None),
+        ("Set the last subtitle to To deployed.", CorrectionTarget.LAST, None),
+        ("Change the last sentence from To developed to To deployed.", CorrectionTarget.LAST, None),
+        ("please change the last sentence to To deployed.", CorrectionTarget.LAST, None),
+        ("Change the last sentence to To deployed", CorrectionTarget.LAST, None),
+    ],
+)
+def test_natural_set_text_target_phrasings(phrase, target, ordinal):
+    parsed = parse_command(phrase)
+    assert parsed.kind is CommandKind.SET_TEXT, parsed.reason
+    assert parsed.target is target
+    assert parsed.ordinal == ordinal
+    assert parsed.replace
+
+
+def test_a_quoted_replacement_is_preserved_exactly():
+    """A typed command is precise, so quotes must not become part of the text."""
+    parsed = parse_command('Change the last sentence to "To deployed."')
+
+    assert parsed.kind is CommandKind.SET_TEXT
+    assert parsed.replace == "To deployed."
+
+
+def test_a_dictated_replacement_without_quotes_still_parses():
+    """Speech-to-text drops quotation marks, so quotes cannot be required."""
+    parsed = parse_command("Change the last sentence to To deployed.")
+
+    assert parsed.kind is CommandKind.SET_TEXT
+    assert parsed.replace == "To deployed."
+
+
+def test_a_replacement_containing_the_word_to_survives_intact():
+    """The worst case for greedy-vs-lazy matching on the connector keyword.
+
+    "To deployed." begins with the connector word "to", so a lazy replacement
+    group would capture an empty string and blank the line.
+    """
+    parsed = parse_command("Change the last sentence to To deployed.")
+
+    assert parsed.replace == "To deployed."
+
+
+def test_a_replacement_containing_quotes_inside_is_kept():
+    parsed = parse_command('Change the last sentence to He said "to be or not to be".')
+
+    assert parsed.replace == 'He said "to be or not to be".'
+
+
+def test_trailing_filler_is_still_removed_from_a_replacement():
+    """Verbatim matching must not reintroduce the noise _strip_filler removes.
+
+    The full stop goes with the ", please." rather than with the sentence: the
+    filler pattern owns the punctuation that terminates it, so what is left is
+    the requested wording. Without quotes that is the most a speaker could ask
+    for, and a typed user who wants the stop can still quote it.
+    """
+    parsed = parse_command("Change the last sentence to To deployed, please.")
+
+    assert parsed.replace == "To deployed"
+
+
+def test_a_set_text_command_ending_in_a_question_mark_keeps_it():
+    parsed = parse_command("Change the last sentence to Is it deployed?")
+
+    assert parsed.replace == "Is it deployed?"
+
+
+def test_set_text_reason_names_the_target():
+    """The reason line is shown to the user, so it must be human-readable."""
+    assert parse_command("Change sentence 3 to To deployed.").describe_target() == "sentence 3"
+    assert parse_command("Change the last sentence to X.").describe_target() == "the last sentence"
+    assert (
+        parse_command("Change the previous sentence to X.").describe_target()
+        == "the previous sentence"
+    )
+    assert parse_command("Change this to X.").describe_target() == "this sentence"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Change this to X",
+        "Change the last sentence to X",
+        "Change the previous sentence to X",
+        "Change sentence 3 to X",
+        "Change the 3rd line to X",
+    ],
+)
+def test_the_reason_never_leaks_an_internal_enum_name(phrase):
+    """The activity log is user-facing.
+
+    An earlier version read "Setting ordinal to ..." because the reason was
+    built from `target.value` rather than the human phrasing, which put an
+    internal identifier in front of whoever was watching the demo.
+    """
+    reason = parse_command(phrase).reason
+
+    assert "ordinal" not in reason.lower()
+    assert "target" not in reason.lower()
+    assert reason.startswith("Setting ")
+
+
+def test_a_reason_does_not_double_the_replacement_punctuation():
+    """The replacement is quoted verbatim, so its full stop is its own."""
+    assert parse_command('Change this to "To deployed."').reason == (
+        'Setting this sentence to "To deployed."'
+    )
+    # ...but a replacement with no terminal punctuation still reads as a sentence.
+    assert parse_command("Change this to To deployed").reason.endswith('deployed".')
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        # A target phrase we do not know. Refusing is the point: guessing would
+        # rewrite whichever line happened to be last.
+        "Change the second-to-last thing to X",
+        "Change the sentence before that to X",
+        "Change the sentence after this to X",
+        "Change the wrong one to X",
+    ],
+)
+def test_an_unrecognised_target_is_refused_not_guessed(phrase):
+    parsed = parse_command(phrase)
+    assert parsed.kind is CommandKind.UNSUPPORTED
+    assert "which line" in parsed.reason.lower()
+
+
+def test_a_set_text_command_with_no_replacement_is_refused():
+    """A truncated dictation must not blank out a transcript line."""
+    assert parse_command("Change the last sentence to").kind is CommandKind.UNSUPPORTED
+    assert parse_command("Replace the last sentence with").kind is CommandKind.UNSUPPORTED
+
+
+def test_an_absurdly_long_replacement_is_refused():
+    """A subtitle line is not a paragraph, and neither is a demo command."""
+    parsed = parse_command("Change the last sentence to " + "word " * 200)
+    assert parsed.kind is CommandKind.UNSUPPORTED
+
+
+@pytest.mark.parametrize(
+    "phrase,kind",
+    [
+        ("Change fast API to FastAPI", CommandKind.REPLACE),
+        ("Replace Alice with Atlas", CommandKind.REPLACE),
+        ("Swap Python for AssemblyAI", CommandKind.REPLACE),
+        ("Correct the last subtitle", CommandKind.CORRECT_LAST),
+        ("Fix the previous subtitle", CommandKind.CORRECT_PREVIOUS),
+        ("Remember FastAPI as a technical term", CommandKind.REMEMBER),
+    ],
+)
+def test_the_new_verb_cannot_shadow_the_existing_commands(phrase, kind):
+    """SET_TEXT is greedy, so it must not swallow the commands that came first.
+
+    "Change fast API to FastAPI" is the flagship demo command; if the new
+    pattern had been checked first without a closed target set it would have
+    parsed as a whole-line rewrite of the last sentence and quietly broken it.
+    """
+    assert parse_command(phrase).kind is kind
+
+
+def test_needs_model_is_true_only_for_correction_questions():
+    """One source of truth for "will this call the gateway".
+
+    The session uses it to decide whether to show a pending state, so if it
+    disagreed with the engine the UI would either spin forever or hide real
+    latency.
+    """
+    from scriptora.services.command_service import needs_model
+
+    assert needs_model(parse_command("Correct the last subtitle")) is True
+    assert needs_model(parse_command("Fix the previous subtitle")) is True
+    # These carry their own answer, so a gateway call could not change them.
+    assert needs_model(parse_command("Change fast API to FastAPI")) is False
+    assert needs_model(parse_command("Change sentence 3 to To deployed.")) is False
+    assert needs_model(parse_command("Remember FastAPI")) is False

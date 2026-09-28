@@ -120,6 +120,46 @@ def test_vocabulary_addition_validation():
 
 
 # ======================================================== rules corrector
+def assert_corrected_as_child(
+    subtitles: SubtitleService, original_id: str, heard: str, expected: str
+):
+    """Assert the whole correction contract in one place.
+
+    The original line must survive untouched, the corrected wording must be a
+    separate child that references it, and that child must sit *immediately*
+    after the original. Every correction test funnels through here so a change
+    to any one of those three properties cannot pass silently in the other 20.
+    """
+    original = subtitles.get(original_id)
+    assert original.text == heard, "the original line must never be overwritten"
+    assert original.raw_text is None, "an original is never corrected in place"
+
+    children = subtitles.corrections_of(original_id)
+    assert len(children) == 1, f"expected exactly one correction, got {len(children)}"
+    child = children[0]
+    assert child.text == expected
+    assert child.corrects_id == original_id
+    assert child.is_correction
+
+    order = subtitles.items
+    assert order.index(child) == order.index(original) + 1, (
+        "the corrected line must appear immediately after the line it corrects"
+    )
+    return child
+
+
+def assert_uncorrected(subtitles: SubtitleService, original_id: str, heard: str):
+    """Assert nothing was written: the line is still exactly what was heard.
+
+    The counterpart to `assert_corrected_as_child`, for the paths that must
+    decline to act. Without it, a silent no-op and a correction that somehow
+    failed to insert a child would look identical.
+    """
+    original = subtitles.get(original_id)
+    assert original.text == heard, "a line that was not corrected must be untouched"
+    assert subtitles.corrections_of(original_id) == [], "no correction should have been inserted"
+
+
 async def test_rules_fixes_the_primary_demo_case(context_with_fastapi):
     subtitles = SubtitleService()
     context = context_with_fastapi
@@ -132,7 +172,16 @@ async def test_rules_fixes_the_primary_demo_case(context_with_fastapi):
 
     assert result.outcome is CorrectionOutcome.APPLIED
     assert result.subtitle_id == sub.id
-    assert subtitles.get(sub.id).text == "Today we're building the backend using FastAPI."
+    assert_corrected_as_child(
+        subtitles,
+        sub.id,
+        "Today we're building the backend using fast API.",
+        "Today we're building the backend using FastAPI.",
+    )
+    # The result must point at the child so the UI can render exactly the line
+    # that changed, while `subtitle_id` keeps pointing at the original.
+    assert result.after == "Today we're building the backend using FastAPI."
+    assert result.corrected_subtitle_id == subtitles.last().id
 
 
 async def test_rules_honours_an_explicit_replace(context_with_fastapi):
@@ -143,7 +192,12 @@ async def test_rules_honours_an_explicit_replace(context_with_fastapi):
 
     await service.correct(parse_command("Replace Alice with Atlas."))
 
-    assert subtitles.get(sub.id).text == "We are working with Atlas on this."
+    assert_corrected_as_child(
+        subtitles,
+        sub.id,
+        "We are working with Alice on this.",
+        "We are working with Atlas on this.",
+    )
 
 
 async def test_rules_reports_no_change_when_nothing_is_wrong(context_with_fastapi):
@@ -182,12 +236,23 @@ async def test_correct_previous_targets_the_earlier_line(context_with_fastapi):
     service = build(subtitles, context_with_fastapi)
     first = subtitles.add("We deploy with fast api.")
     first.finalize()
-    subtitles.finalize("This is the second line.")
+    second = subtitles.add("This is the second line.")
+    second.finalize()
 
     result = await service.correct(parse_command("Fix the previous subtitle."))
 
     assert result.subtitle_id == first.id
-    assert "FastAPI" in subtitles.get(first.id).text
+    assert_corrected_as_child(
+        subtitles,
+        first.id,
+        "We deploy with fast api.",
+        "We deploy with FastAPI.",
+    )
+    # The second line is untouched and is still the last *original*, so a
+    # follow-up "correct the last subtitle" lands on it rather than on the
+    # correction we just inserted after the first line.
+    assert "second line" in subtitles.last_original().text
+    assert subtitles.last_original().id == second.id
 
 
 # ============================================================== remember
@@ -225,7 +290,12 @@ async def test_remembered_term_is_used_by_the_next_correction(context_with_fasta
 
     await service.correct(parse_command("Correct the last subtitle."))
 
-    assert "FastAPI" in subtitles.get(sub.id).text
+    assert_corrected_as_child(
+        subtitles,
+        sub.id,
+        "We rely on fast api for the service.",
+        "We rely on FastAPI for the service.",
+    )
 
 
 # ============================================================== LLM paths
@@ -253,7 +323,12 @@ async def test_llm_result_is_applied_when_valid(context_with_fastapi):
 
     assert result.outcome is CorrectionOutcome.APPLIED
     assert result.backend == "llm"
-    assert subtitles.get(sub.id).text == "Today we are building the backend using FastAPI."
+    assert_corrected_as_child(
+        subtitles,
+        sub.id,
+        "Today we're building the backend using fast API.",
+        "Today we are building the backend using FastAPI.",
+    )
 
 
 async def test_llm_response_with_invented_id_is_discarded(context_with_fastapi):
@@ -272,8 +347,8 @@ async def test_llm_response_with_invented_id_is_discarded(context_with_fastapi):
         await service.correct(parse_command("Correct the last subtitle."))
 
     # Falls back to the deterministic result; "HACKED" never reaches state.
-    assert subtitles.get(sub.id).text == "Using FastAPI."
-    assert "HACKED" not in subtitles.get(sub.id).text
+    assert_corrected_as_child(subtitles, sub.id, "Using fast API.", "Using FastAPI.")
+    assert "HACKED" not in "".join(item.text for item in subtitles)
 
 
 @pytest.mark.parametrize(
@@ -295,7 +370,7 @@ async def test_invalid_llm_output_falls_back_to_rules(bad_content, context_with_
     with patch("httpx.AsyncClient.post", return_value=_llm_response(bad_content)):
         result = await service.correct(parse_command("Correct the last subtitle."))
 
-    assert subtitles.get(sub.id).text == "Using FastAPI."
+    assert_corrected_as_child(subtitles, sub.id, "Using fast API.", "Using FastAPI.")
     assert result.outcome is CorrectionOutcome.APPLIED
 
 
@@ -365,7 +440,7 @@ async def test_explicit_replace_wins_over_llm_rewrite(context_with_fastapi):
     with patch("httpx.AsyncClient.post", return_value=_llm_response(llm_says)) as post:
         result = await service.correct(parse_command("Replace Alice with Atlas."))
 
-    assert subtitles.get(sub.id).text == "We work with Atlas."
+    assert_corrected_as_child(subtitles, sub.id, "We work with Alice.", "We work with Atlas.")
     # No HTTP call: the answer could not have changed the outcome.
     assert post.call_count == 0
     # And it is never misattributed to the model.
@@ -392,7 +467,7 @@ async def test_replace_skips_the_llm_even_when_the_edit_is_impossible(context_wi
 
     assert post.call_count == 0
     assert result.outcome is CorrectionOutcome.NO_ACTION
-    assert subtitles.get(sub.id).text == "Nothing relevant here."
+    assert_uncorrected(subtitles, sub.id, "Nothing relevant here.")
 
 
 async def test_correction_commands_still_consult_the_llm(context_with_fastapi):
@@ -412,7 +487,161 @@ async def test_correction_commands_still_consult_the_llm(context_with_fastapi):
 
     assert post.call_count == 1
     assert result.backend == "llm"
-    assert subtitles.get(sub.id).text == "we use FastAPI here"
+    assert_corrected_as_child(subtitles, sub.id, "we use fast api here", "we use FastAPI here")
+
+
+# ============================== mishearing repaired without vocabulary support
+# Regression cover for the live demo failure: AssemblyAI heard "Quen", the user
+# said "Correct the last subtitle", and nothing happened. The model declined
+# because the prompt only ever anchored corrections to `project_vocabulary`, and
+# "Qwen" was not in it. The fix is a general prompt tier, NOT a Quen->Qwen rule,
+# so these tests use several different mishearings and assert the rules engine
+# cannot do it alone.
+
+
+def test_the_rules_engine_cannot_repair_a_wrong_letter():
+    """Why the model tier exists at all.
+
+    `make_lookup_pattern` tolerates whitespace and casing between characters but
+    not a substituted letter, so "Quen" can never match "Qwen". This is asserted
+    deliberately: if someone ever hard-codes Quen->Qwen into the rules path, this
+    test is what notices.
+    """
+    context = ContextService()
+    context.add_term("Qwen")
+    # A wrong letter is not a spacing/casing variant, so the deterministic path
+    # leaves it alone in both directions. Only the model tier repairs these.
+    assert context.restore_terms("Quen.") == "Quen."
+    assert context.restore_terms("Quwen.") == "Quwen."
+    # ...whereas the variants it *is* built for are repaired offline, no network.
+    assert context.restore_terms("q wen.") == "Qwen."
+    assert context.restore_terms("Q W E N.") == "Qwen."
+
+
+async def test_a_mishearing_is_repaired_when_the_term_is_not_in_the_vocabulary():
+    """The reported bug, end to end through the real service.
+
+    "Qwen" is deliberately absent from the project context, so this only passes
+    if the correction came from the model reasoning about the mishearing rather
+    than from a vocabulary lookup.
+    """
+    subtitles = SubtitleService()
+    context = ContextService()
+    assert "Qwen" not in context.terms
+    service = build(subtitles, context, backend="llm")
+    sub = subtitles.add("Quen.")
+    sub.finalize()
+
+    model_says = (
+        '{"action": "correct_subtitle", "target_subtitle_id": "' + sub.id + '", '
+        '"replacement_text": "Qwen.", "reason": "clear mishearing of a known tool"}'
+    )
+    with patch("httpx.AsyncClient.post", return_value=_llm_response(model_says)):
+        result = await service.correct(parse_command("Correct the last subtitle"))
+
+    assert result.outcome is CorrectionOutcome.APPLIED
+    assert result.backend == "llm"
+    assert_corrected_as_child(subtitles, sub.id, "Quen.", "Qwen.")
+
+
+@pytest.mark.parametrize(
+    ("heard", "expected"),
+    [
+        ("Quen.", "Qwen."),
+        ("kubernetties are hard.", "Kubernetes are hard."),
+        ("we deploy with kubernets.", "we deploy with Kubernetes."),
+    ],
+)
+async def test_the_repair_is_general_not_keyword_specific(heard, expected):
+    """Several unrelated mishearings, none of them known to the codebase."""
+    subtitles = SubtitleService()
+    service = build(subtitles, ContextService(), backend="llm")
+    sub = subtitles.add(heard)
+    sub.finalize()
+
+    model_says = (
+        '{"action": "correct_subtitle", "target_subtitle_id": "' + sub.id + '", '
+        '"replacement_text": "' + expected + '", "reason": "mishearing"}'
+    )
+    with patch("httpx.AsyncClient.post", return_value=_llm_response(model_says)):
+        result = await service.correct(parse_command("Correct the last subtitle"))
+
+    assert result.outcome is CorrectionOutcome.APPLIED
+    assert_corrected_as_child(subtitles, sub.id, heard, expected)
+
+
+async def test_an_unfamiliar_word_is_left_alone(context_with_fastapi):
+    """The guard against the opposite failure: inventing a word to fill a gap.
+
+    The model returns `no_action`, so the subtitle is untouched.
+    """
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi, backend="llm")
+    sub = subtitles.add("blargh")
+    sub.finalize()
+
+    declined = (
+        '{"action": "no_action", "target_subtitle_id": null, "replacement_text": null, '
+        '"vocabulary_term": null, "reason": "term is unfamiliar; no confident correction"}'
+    )
+    with patch("httpx.AsyncClient.post", return_value=_llm_response(declined)):
+        result = await service.correct(parse_command("Correct the last subtitle"))
+
+    assert result.outcome is CorrectionOutcome.NO_ACTION
+    assert_uncorrected(subtitles, sub.id, "blargh")
+
+
+async def test_a_declined_correction_explains_itself(context_with_fastapi):
+    """The user must learn *why* nothing changed.
+
+    This was the second half of the live bug: the model said no_action with a
+    clear reason, the service discarded that reason, and the UI logged only
+    "No correction was needed." - which reads as the subtitle being correct.
+    """
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi, backend="llm")
+    sub = subtitles.add("Quen.")
+    sub.finalize()
+
+    declined = (
+        '{"action": "no_action", "target_subtitle_id": null, "replacement_text": null, '
+        '"vocabulary_term": null, "reason": "no confident correction for this word"}'
+    )
+    with patch("httpx.AsyncClient.post", return_value=_llm_response(declined)):
+        result = await service.correct(parse_command("Correct the last subtitle"))
+
+    assert result.outcome is CorrectionOutcome.NO_ACTION
+    assert result.reason == "no confident correction for this word"
+
+
+def test_the_prompt_allows_vocabulary_free_correction_and_forbids_inventing():
+    """Guard the prompt contract, since a regression here is invisible offline.
+
+    Verified against the live gateway, where this tier turns "Quen" into "Qwen"
+    while leaving "blargh", plain sentences and real proper nouns untouched.
+    """
+    prompt = correction_service.SYSTEM_PROMPT
+    assert "NOT in project_vocabulary" in prompt
+    assert "Never invent a replacement word" in prompt
+    assert "merely unfamiliar is NOT an error" in prompt
+
+
+async def test_a_vocabulary_term_split_by_speech_is_rejoined(context_with_fastapi):
+    """The vocabulary tier still works after the prompt change."""
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi, backend="llm")
+    sub = subtitles.add("we use fast API here")
+    sub.finalize()
+
+    model_says = (
+        '{"action": "correct_subtitle", "target_subtitle_id": "' + sub.id + '", '
+        '"replacement_text": "we use FastAPI here", "reason": "canonical spelling"}'
+    )
+    with patch("httpx.AsyncClient.post", return_value=_llm_response(model_says)):
+        result = await service.correct(parse_command("Correct the last subtitle"))
+
+    assert result.outcome is CorrectionOutcome.APPLIED
+    assert_corrected_as_child(subtitles, sub.id, "we use fast API here", "we use FastAPI here")
 
 
 async def test_no_api_key_disables_the_llm_backend(context_with_fastapi):
@@ -517,7 +746,7 @@ async def test_a_pending_gateway_request_does_not_block_the_event_loop(context_w
     assert result.backend == "llm"
     assert result.outcome is CorrectionOutcome.APPLIED
     assert result.subtitle_id == sub.id
-    assert subtitles.get(sub.id).text == "we use FastAPI here"
+    assert_corrected_as_child(subtitles, sub.id, "we use fast api here", "we use FastAPI here")
 
 
 async def test_a_literal_replace_costs_no_gateway_request_while_others_wait(context_with_fastapi):
@@ -542,7 +771,12 @@ async def test_a_literal_replace_costs_no_gateway_request_while_others_wait(cont
     assert post.call_count == 0
     assert result.backend == "rules"
     assert result.outcome is CorrectionOutcome.APPLIED
-    assert subtitles.get(sub.id).text == "We are working with Atlas on this."
+    assert_corrected_as_child(
+        subtitles,
+        sub.id,
+        "We are working with Alice on this.",
+        "We are working with Atlas on this.",
+    )
 
 
 async def test_the_gateway_timeout_is_preserved(context_with_fastapi):
@@ -588,7 +822,7 @@ async def test_an_unreachable_gateway_still_falls_back_without_raising(context_w
     assert result.outcome is CorrectionOutcome.APPLIED
     assert result.backend == "rules"
     assert "AI unavailable" in result.reason
-    assert subtitles.get(sub.id).text == "Using FastAPI."
+    assert_corrected_as_child(subtitles, sub.id, "Using fast API.", "Using FastAPI.")
 
 
 async def test_the_async_client_is_closed_after_each_request(context_with_fastapi):
@@ -627,3 +861,239 @@ async def test_the_async_client_is_closed_after_each_request(context_with_fastap
 
     assert closed == [True]
     assert result.backend == "llm"
+
+
+# ===================================================== natural set-text
+async def test_set_text_replaces_the_named_ordinal(context_with_fastapi):
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    for text in ("First line.", "Second line.", "Third line."):
+        subtitles.add(text).finalize()
+
+    result = await service.correct(parse_command("Change sentence 3 to To deployed."))
+
+    assert result.outcome is CorrectionOutcome.APPLIED
+    assert_corrected_as_child(subtitles, subtitles.originals()[2].id, "Third line.", "To deployed.")
+    # The lines either side of the target must be completely untouched.
+    assert_uncorrected(subtitles, subtitles.originals()[0].id, "First line.")
+    assert_uncorrected(subtitles, subtitles.originals()[1].id, "Second line.")
+
+
+@pytest.mark.parametrize(
+    "phrase", ["Change the last sentence to X", "Change this to X", "Change the last subtitle to X"]
+)
+async def test_this_and_last_resolve_to_the_same_line(phrase, context_with_fastapi):
+    """Two words for one intent. If they ever diverged, one would be a lie."""
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    first = subtitles.add("First line.")
+    first.finalize()
+    second = subtitles.add("Second line.")
+    second.finalize()
+
+    result = await service.correct(parse_command(phrase))
+
+    assert result.subtitle_id == second.id
+    assert first.id not in {c.corrects_id for c in subtitles.corrections_of(second.id)}
+
+
+async def test_previous_resolves_to_the_line_before_the_last(context_with_fastapi):
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    first = subtitles.add("First line.")
+    first.finalize()
+    second = subtitles.add("Second line.")
+    second.finalize()
+
+    result = await service.correct(parse_command("Change the previous sentence to X"))
+
+    assert result.subtitle_id == first.id
+    assert_uncorrected(subtitles, second.id, "Second line.")
+
+
+async def test_a_correction_does_not_shift_later_ordinals(context_with_fastapi):
+    """The property that makes "sentence 3" trustworthy over a long session.
+
+    Inserting a child line would, if ordinals counted raw list positions, make
+    every later sentence address the wrong text. Corrections are excluded from
+    the numbering for exactly this reason.
+    """
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    lines = [f"Line {n}." for n in range(1, 6)]
+    for text in lines:
+        subtitles.add(text).finalize()
+
+    await service.correct(parse_command("Change sentence 2 to Second, fixed."))
+    # A second correction, to prove it is not a one-off.
+    await service.correct(parse_command("Change sentence 1 to First, fixed."))
+
+    # The originals are, by design, still exactly what was spoken. What the
+    # corrections changed is recorded against them, in order.
+    assert [item.text for item in subtitles.originals()] == lines
+    corrected = [
+        c.text for item in subtitles.originals() for c in subtitles.corrections_of(item.id)
+    ]
+    assert corrected == ["First, fixed.", "Second, fixed."]
+    # And the children really are interleaved in the raw list, which is the
+    # condition the ordinal exclusion exists to survive.
+    assert len(subtitles.items) == 7
+
+
+async def test_repeated_corrections_of_one_line_are_listed_in_order(context_with_fastapi):
+    """Correcting the same line twice must not reverse its two children.
+
+    Both children sit directly after their original, so the only thing
+    separating them is the insertion point. Using the original's index every
+    time puts the newest correction first, which makes the edits read
+    backwards and drifts them away from the line they belong to.
+    """
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    for text in ("First line.", "Second line."):
+        subtitles.add(text).finalize()
+    first = subtitles.original_at(1)
+
+    await service.correct(parse_command("Change sentence 1 to First, once."))
+    await service.correct(parse_command("Change sentence 1 to First, twice."))
+
+    assert [c.text for c in subtitles.corrections_of(first.id)] == [
+        "First, once.",
+        "First, twice.",
+    ]
+    # The newest edit is the one that follows the original, not the oldest.
+    assert [item.text for item in subtitles.items] == [
+        "First line.",
+        "First, once.",
+        "First, twice.",
+        "Second line.",
+    ]
+    # The original is still untouched, and a third correction lands after both.
+    assert subtitles.get(first.id).text == "First line."
+    await service.correct(parse_command("Change sentence 1 to First, thrice."))
+    assert [c.text for c in subtitles.corrections_of(first.id)] == [
+        "First, once.",
+        "First, twice.",
+        "First, thrice.",
+    ]
+
+
+async def test_previous_skips_over_corrections(context_with_fastapi):
+    """After correcting line 1, "previous" must still mean line 2.
+
+    Counting raw positions would make it return the child under line 1.
+    """
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    for text in ("First line.", "Second line.", "Third line."):
+        subtitles.add(text).finalize()
+
+    await service.correct(parse_command("Change sentence 1 to First, fixed."))
+    result = await service.correct(parse_command("Change the previous sentence to X"))
+
+    assert result.subtitle_id == subtitles.originals()[1].id
+
+
+async def test_an_out_of_range_ordinal_is_refused_with_a_useful_count(context_with_fastapi):
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    for text in ("First line.", "Second line."):
+        subtitles.add(text).finalize()
+
+    result = await service.correct(parse_command("Change sentence 9 to X"))
+
+    assert result.outcome is CorrectionOutcome.INVALID
+    # Not "speak first": two lines do exist, the third just does not.
+    assert "no sentence 9" in result.message.lower()
+    assert "2 spoken lines" in result.message.lower()
+
+
+async def test_previous_with_only_one_line_says_so(context_with_fastapi):
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    subtitles.add("Only line.").finalize()
+
+    result = await service.correct(parse_command("Change the previous sentence to X"))
+
+    assert result.outcome is CorrectionOutcome.INVALID
+    assert "no previous" in result.message.lower()
+
+
+async def test_set_text_makes_no_gateway_call(context_with_fastapi):
+    """The whole point of SET_TEXT: the answer is already in the command.
+
+    A gateway round trip here would add seconds of latency to the single most
+    common correction the demo performs, and could not change the result.
+    """
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi, backend="llm")
+    subtitles.add("we use fast api here").finalize()
+
+    with patch("httpx.AsyncClient.post") as post:
+        result = await service.correct(parse_command("Change the last sentence to To deployed."))
+
+    assert post.call_count == 0
+    assert result.backend == "rules"
+    assert result.outcome is CorrectionOutcome.APPLIED
+
+
+async def test_set_text_reports_no_action_when_the_text_already_matches(context_with_fastapi):
+    """Asking for what is already there must do nothing, not add a duplicate."""
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    sub = subtitles.add("To deployed.")
+    sub.finalize()
+
+    result = await service.correct(parse_command('Change the last sentence to "To deployed."'))
+
+    assert result.outcome is CorrectionOutcome.NO_ACTION
+    assert_uncorrected(subtitles, sub.id, "To deployed.")
+
+
+async def test_set_text_keeps_the_terminal_punctuation_of_a_dictated_replacement(
+    context_with_fastapi,
+):
+    """The replacement is the user's wording, not dictation noise.
+
+    Every other command strips a trailing full stop before matching, because
+    there the punctuation is an artefact of speech-to-text. Here the text is
+    the thing being spoken into the transcript, so stripping it would change
+    the sentence the user asked for - and would make a rewrite of an identical
+    line look like a real change.
+    """
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    sub = subtitles.add("to developed")
+    sub.finalize()
+
+    result = await service.correct(parse_command("Change the last sentence to To deployed."))
+
+    assert result.after == "To deployed."
+
+
+async def test_set_text_lands_the_replacement_verbatim(context_with_fastapi):
+    """Punctuation and capitalisation must survive, including inner quotes."""
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    sub = subtitles.add("to developed")
+    sub.finalize()
+
+    result = await service.correct(
+        parse_command("Change the last sentence to \"He said 'to be', then stopped.\"")
+    )
+
+    assert result.after == "He said 'to be', then stopped."
+
+
+async def test_a_quoted_set_text_target_works_end_to_end(context_with_fastapi):
+    """The exact phrasing from the demo script, verified through the engine."""
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    for text in ("First line.", "Second line.", "we should changed the config"):
+        subtitles.add(text).finalize()
+    third = subtitles.originals()[2]
+
+    result = await service.correct(parse_command('Change the 3rd sentence to "To deployed."'))
+
+    assert result.outcome is CorrectionOutcome.APPLIED
+    assert_corrected_as_child(subtitles, third.id, "we should changed the config", "To deployed.")

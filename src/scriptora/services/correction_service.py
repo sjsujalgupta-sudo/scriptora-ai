@@ -32,7 +32,7 @@ from ..models.correction import (
     extract_json_object,
 )
 from ..models.subtitle import Subtitle
-from .command_service import CommandKind, ParsedCommand
+from .command_service import CommandKind, CorrectionTarget, ParsedCommand, needs_model
 from .context_service import ContextService
 from .subtitle_service import SubtitleNotFound, SubtitleService
 
@@ -47,17 +47,26 @@ SYSTEM_PROMPT = (
     ' "replacement_text": string | null,\n'
     ' "vocabulary_term": string | null,\n'
     ' "reason": string}\n\n'
+    "What to correct, in priority order:\n"
+    "1. If the command is a replace ('change X to Y'), apply exactly that edit.\n"
+    "2. If a word from project_vocabulary appears with wrong casing or spacing, "
+    "use the exact spelling from project_vocabulary. Example: 'fast API' becomes "
+    "'FastAPI'.\n"
+    "3. If a single word is a clear mishearing of a well-known name, product or "
+    "technical term, and you are confident of the correct spelling, fix it even "
+    "when it is NOT in project_vocabulary. Examples: 'Quen' becomes 'Qwen', "
+    "'kubernetties' becomes 'Kubernetes'.\n\n"
     "Rules:\n"
-    "1. Set target_subtitle_id to the id of the subtitle you were asked to fix. "
+    "- Set target_subtitle_id to the id of the subtitle you were asked to fix. "
     "Use only an id present in the input. Never invent an id.\n"
-    "2. If the command is a replace ('change X to Y'), apply exactly that edit.\n"
-    "3. Otherwise, correct only clear speech-to-text errors: wrong casing or "
-    "spacing of a term in project_vocabulary, and obvious misrecognitions. "
-    "Use the exact spelling from project_vocabulary.\n"
-    "4. Preserve the speaker's words, order and punctuation. Never summarise, "
-    "translate, expand abbreviations or add commentary.\n"
-    "5. If nothing needs changing, return action 'no_action'.\n"
-    "6. Keep replacement_text under 500 characters."
+    "- Change as few words as possible. Repair only the misheard word and leave "
+    "every other character identical, including punctuation and capitalisation.\n"
+    "- Never summarise, translate, expand abbreviations or add commentary.\n"
+    "- A word that is merely unfamiliar is NOT an error. If you cannot say what "
+    "it should be, leave it exactly as spoken. Never invent a replacement word.\n"
+    "- If nothing needs changing, return action 'no_action' with "
+    "replacement_text null.\n"
+    "- Keep replacement_text under 500 characters."
 )
 
 
@@ -71,6 +80,12 @@ class RuleCorrector:
     ) -> str:
         """Return the corrected text for `subtitle`."""
         text = subtitle.text
+
+        if command.kind is CommandKind.SET_TEXT and command.replace:
+            # The user stated the replacement outright, so there is nothing to
+            # infer. Deliberately not passed through the lookup pattern: "to
+            # deployed." must land verbatim, punctuation included.
+            return command.replace.strip()
 
         if command.kind is CommandKind.REPLACE and command.find and command.replace:
             try:
@@ -264,6 +279,15 @@ class CorrectionService:
         return "rules"
 
     # ------------------------------------------------------------------ api
+    def resolve(self, command: ParsedCommand) -> Subtitle | None:
+        """Which line this command refers to, without changing anything.
+
+        Exposed so the session can reject a second correction aimed at a line
+        that is already waiting on the model, using the same resolution rules
+        the engine would use.
+        """
+        return self._resolve_target(command)
+
     def remember(self, command: ParsedCommand) -> CorrectionResult:
         """Add a term to the vocabulary (the "Remember ..." command)."""
         if command.kind is not CommandKind.REMEMBER:
@@ -321,6 +345,31 @@ class CorrectionService:
 
         target = self._resolve_target(command)
         if target is None:
+            # Distinguish "nothing spoken yet" from "you asked for a line that
+            # does not exist" - the second is a targeting mistake, and telling
+            # the user to speak first would be actively misleading.
+            if command.target is CorrectionTarget.ORDINAL:
+                available = len(self._subtitles.originals())
+                if available == 0:
+                    detail = "There are no spoken lines yet. Speak first, then correct."
+                else:
+                    detail = (
+                        f"There {'is' if available == 1 else 'are'} {available} spoken "
+                        f"{'line' if available == 1 else 'lines'} so far."
+                    )
+                return CorrectionResult.failure(
+                    CorrectionOutcome.INVALID,
+                    f"There is no sentence {command.ordinal}. {detail}",
+                    backend=self._static_backend,
+                    reason=command.reason,
+                )
+            if command.target is CorrectionTarget.PREVIOUS and self._subtitles.last_original():
+                return CorrectionResult.failure(
+                    CorrectionOutcome.INVALID,
+                    "There is no previous subtitle yet - this is the first one.",
+                    backend=self._static_backend,
+                    reason=command.reason,
+                )
             return CorrectionResult.failure(
                 CorrectionOutcome.INVALID,
                 "There are no subtitles to correct yet. Speak first, then correct.",
@@ -338,14 +387,14 @@ class CorrectionService:
         #    upgraded to "llm" only when the model actually produced the text
         #    that gets applied, so the UI never misattributes a result.
         #
-        #    A literal "change X to Y" is skipped entirely: the deterministic
-        #    path already performs it exactly, and the model is instructed to
-        #    apply exactly that edit too, so its answer could only ever be
-        #    discarded. The gateway call is now non-blocking, so this saves a
-        #    pointless round trip and its latency rather than protecting the
-        #    event loop - but it is still the most common command in the demo,
-        #    and a request that cannot change the result is pure latency.
-        if self._llm is not None and command.kind is not CommandKind.REPLACE:
+        #    Two kinds are skipped entirely. A literal "change X to Y" is
+        #    already performed exactly by the deterministic path, and a
+        #    "change <line> to <text>" carries the answer in the command, so
+        #    neither can be changed by a model. Skipping them is what keeps
+        #    the common correction instant: the gateway round trip is the only
+        #    thing in this method that costs the user visible time.
+        consult_model = needs_model(command)
+        if self._llm is not None and consult_model:
             proposal = await self._try_llm(target, command)
 
             if proposal is not None and proposal.is_valid_for(self._subtitles.known_ids()):
@@ -358,6 +407,13 @@ class CorrectionService:
                     reason = proposal.reason or command.reason
             elif proposal is None:
                 reason = f"{command.reason} (AI unavailable, applied rules)"
+            else:
+                # The model declined - usually `no_action`. It normally explains
+                # itself, and that explanation is the only thing that tells the
+                # user *why* a subtitle did not change, so it is surfaced rather
+                # than dropped on the floor behind a bare "No correction was
+                # needed."
+                reason = proposal.reason or command.reason
 
         if fallback.strip() == target.text.strip():
             return CorrectionResult(
@@ -372,7 +428,10 @@ class CorrectionService:
 
         before = target.text
         try:
-            self._subtitles.correct(target.id, fallback)
+            # The original is left untouched; the corrected wording becomes a
+            # child line directly after it so the transcript still shows what
+            # AssemblyAI actually heard.
+            child = self._subtitles.correct_as_child(target.id, fallback)
         except (SubtitleNotFound, ValueError) as exc:
             return CorrectionResult.failure(
                 CorrectionOutcome.ERROR,
@@ -386,8 +445,9 @@ class CorrectionService:
             backend=backend,
             action=CorrectionAction.CORRECT_SUBTITLE,
             subtitle_id=target.id,
+            corrected_subtitle_id=child.id,
             before=before,
-            after=fallback,
+            after=child.text,
             reason=reason,
         )
 
@@ -406,6 +466,20 @@ class CorrectionService:
             return None
 
     def _resolve_target(self, command: ParsedCommand) -> Subtitle | None:
+        """Resolve the line a command refers to.
+
+        Resolved against `originals()`, never the raw list, so an inserted
+        correction can never be addressed as "the last sentence" or shift the
+        meaning of "the third sentence".
+        """
         if command.kind is CommandKind.CORRECT_PREVIOUS:
-            return self._subtitles.previous()
-        return self._subtitles.last()
+            return self._subtitles.previous_original()
+        if command.kind is CommandKind.SET_TEXT and command.target is CorrectionTarget.ORDINAL:
+            return self._subtitles.original_at(command.ordinal or 0)
+        if command.target is CorrectionTarget.PREVIOUS:
+            return self._subtitles.previous_original()
+        if command.target is CorrectionTarget.ORDINAL:
+            return self._subtitles.original_at(command.ordinal or 0)
+        # THIS and LAST both mean the newest line; the distinction exists for the
+        # user's benefit, not to select a different subtitle.
+        return self._subtitles.last_original()

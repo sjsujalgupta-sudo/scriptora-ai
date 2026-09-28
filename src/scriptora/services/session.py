@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 from ..config import Settings
@@ -24,7 +26,7 @@ from ..models.correction import CorrectionAction, CorrectionOutcome, CorrectionR
 from ..models.events import EventType, ServerEvent
 from ..models.subtitle import Subtitle
 from .assemblyai_service import AssemblyAIRealtimeService
-from .command_service import CommandKind, ParsedCommand, parse_command
+from .command_service import CommandKind, ParsedCommand, needs_model, parse_command
 from .context_service import ContextService
 from .correction_service import CorrectionService
 from .subtitle_service import SubtitleService
@@ -50,6 +52,14 @@ _COMMANDS: tuple[tuple[CommandKind, tuple[str, ...]], ...] = (
         ),
     ),
     (CommandKind.REPLACE, ("change ", "replace ", "swap ")),
+    # Natural "change this / sentence 3 to <text>" phrasing. The REPLACE row
+    # above already covers "change " and "replace "; these add the verbs that
+    # only ever mean a whole-line rewrite, so a dictated "rewrite the third
+    # sentence to ..." is recognised as a command at all.
+    (
+        CommandKind.SET_TEXT,
+        ("rewrite ", "rewrite\u00a0", "make ", "set ", "put "),
+    ),
 )
 
 
@@ -67,11 +77,23 @@ class ScriptoraSession:
         self._assemblyai = AssemblyAIRealtimeService(settings)
 
         self.status = "idle"
-        self._audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        # Bounded: see `send_audio`. Sized as ~1 s of audio at the configured
+        # frame duration, which is enough to absorb WebSocket jitter without
+        # letting latency run away on a slow link.
+        self._audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(
+            maxsize=max(2, int(1000 / self._settings.frame_duration_ms) + 1)
+        )
+        self._dropped_frames = 0
+        self._stopping = False
         self._stream_task: asyncio.Task[None] | None = None
+        # Fire-and-forget emits that must outlive the callback that started them.
+        self._background_tasks: set[asyncio.Task[None]] = set()
         self._running = False
         self._turns_seen = 0
         self._correction_count = 0
+        # Subtitle ids with a correction in flight, so a second command aimed at
+        # the same line is refused instead of racing the first one.
+        self._pending: set[str] = set()
 
     # ---------------------------------------------------------------- setup
     @property
@@ -120,46 +142,79 @@ class ScriptoraSession:
             self._assemblyai.stream(self._frame_generator()),
             name=f"scriptora-stream-{self.id}",
         )
+        self._stream_task.add_done_callback(self._on_stream_finished)
 
     async def stop(self) -> None:
-        """Stop listening and release the AssemblyAI session."""
+        """Stop listening and release the AssemblyAI session.
+
+        Ordering matters. The sentinel is queued first so every buffered frame
+        is still handed to AssemblyAI, then the stream is allowed to finish
+        before the session is terminated. Terminating first, or cancelling the
+        stream, discards the final words of the session.
+        """
         if not self._running:
             return
         self._running = False
+        self._stopping = True
         self.status = "stopping"
-        await self._emit(EventType.STATUS, "Stopping...")
+        try:
+            await self._emit(EventType.STATUS, "Stopping...")
 
-        # End the frame generator, let the stream task finish, then terminate
-        # the AssemblyAI session so the final turn is flushed and billing stops.
-        await self._audio_queue.put(None)
-        if self._stream_task is not None:
-            try:
-                await asyncio.wait_for(self._stream_task, timeout=5.0)
-            except TimeoutError:
-                self._stream_task.cancel()
-            except Exception as exc:
-                logger.info("Audio stream ended with %s", type(exc).__name__)
-            self._stream_task = None
+            # End the frame generator, let the stream task finish, then
+            # terminate so AssemblyAI flushes the final turn and billing stops.
+            await self._audio_queue.put(None)
+            if self._stream_task is not None:
+                try:
+                    await asyncio.wait_for(self._stream_task, timeout=10.0)
+                except TimeoutError:
+                    logger.warning(
+                        "Stream did not finish within 10s; %d frame(s) undrained",
+                        self._audio_queue.qsize(),
+                    )
+                    self._stream_task.cancel()
+                except Exception as exc:
+                    logger.info("Audio stream ended with %s", type(exc).__name__)
+                self._stream_task = None
 
-        await self._assemblyai.disconnect()
-        self.status = "idle"
+            await self._assemblyai.disconnect()
+            self.status = "idle"
 
-        await self._emit(
-            EventType.SESSION_ENDED,
-            f"Stopped. {self._turns_seen} turn(s), {self._correction_count} correction(s).",
-            payload={
-                "turns": self._turns_seen,
-                "corrections": self._correction_count,
-                "subtitle_count": len(self.subtitles),
-            },
-        )
+            if self._dropped_frames:
+                logger.info("Dropped %d audio frame(s) during this session", self._dropped_frames)
+
+            await self._emit(
+                EventType.SESSION_ENDED,
+                f"Stopped. {self._turns_seen} turn(s), {self._correction_count} correction(s).",
+                payload={
+                    "turns": self._turns_seen,
+                    "corrections": self._correction_count,
+                    "subtitle_count": len(self.subtitles),
+                },
+            )
+        finally:
+            self._stopping = False
 
     # ----------------------------------------------------------------- audio
     async def send_audio(self, chunk: bytes) -> None:
-        """Queue one audio frame from the browser."""
+        """Queue one audio frame from the browser.
+
+        The queue is bounded and drops its oldest frame when full. An unbounded
+        queue does not apply backpressure here - it just relocates the backlog,
+        and the live transcript drifts further behind the speaker for the rest
+        of the session. Dropping the oldest frame keeps latency near the cap:
+        during live speech the newest audio is the only audio that still matters.
+        """
         if not self._running:
             return
-        await self._audio_queue.put(chunk)
+        try:
+            self._audio_queue.put_nowait(chunk)
+        except asyncio.QueueFull:
+            with suppress(asyncio.QueueEmpty):
+                self._audio_queue.get_nowait()
+            self._dropped_frames += 1
+            logger.debug("Audio queue full; dropped a frame (%d total)", self._dropped_frames)
+            with suppress(asyncio.QueueFull):
+                self._audio_queue.put_nowait(chunk)
 
     async def _frame_generator(self) -> AsyncIterator[bytes]:
         """Yield AssemblyAI-sized frames pulled from the browser queue.
@@ -171,9 +226,18 @@ class ScriptoraSession:
 
         The generator ends when `None` is queued, which is how `stop()` drains
         the session cleanly.
+
+        Frames are handed over at exactly one per frame duration. The SDK's
+        `stream()` pushes each frame into its own unbounded write queue as fast
+        as this generator yields, so an unpaced generator lets the socket fall
+        behind and then dumps the accumulated backlog as a burst on the way out.
+        Real-time pacing keeps AssemblyAI receiving audio at 1x, which is what
+        the server expects.
         """
         target = self._settings.frame_bytes
+        frame_seconds = self._settings.frame_duration_ms / 1000
         carry = b""
+        due = time.perf_counter()
 
         while True:
             frame = await self._audio_queue.get()
@@ -184,8 +248,15 @@ class ScriptoraSession:
 
             carry += frame
             while len(carry) >= target:
-                yield carry[:target]
+                chunk = carry[:target]
                 carry = carry[target:]
+                yield chunk
+                # Pace to wall-clock, not to a sleep per frame, so a late
+                # frame does not permanently shift the cadence.
+                due += frame_seconds
+                delay = due - time.perf_counter()
+                if delay > 0:
+                    await asyncio.sleep(delay)
 
         # Never send a short trailing frame; drop it rather than risk error 3007.
         if carry:
@@ -229,16 +300,96 @@ class ScriptoraSession:
         await self._emit(EventType.STATUS, message)
 
     async def _handle_error(self, message: str, fatal: bool) -> None:
+        # A connection-closed error arriving while `stop()` is shutting the
+        # session down is the expected consequence of closing it, not a
+        # failure the user needs to act on. SESSION_ENDED already reports a
+        # clean stop, and surfacing an error here left the UI stuck on "Error"
+        # after a perfectly normal Stop.
+        if self._stopping:
+            logger.info("Connection closed during shutdown: %s", message)
+            return
         self.status = "error" if fatal else self.status
         await self._emit(EventType.ERROR, message, payload={"fatal": fatal})
         if fatal:
             self._running = False
 
+    def _on_stream_finished(self, task: asyncio.Task[None]) -> None:
+        """Report a stream that died on its own, while the session looked live.
+
+        A dropped connection or a suspended laptop ends the SDK task without
+        ever reaching `_handle_error`. Without this the browser would keep
+        showing "Listening" against a socket that is no longer recording, so
+        the user would keep talking to a session that is already gone.
+        """
+        # A normal `stop()` drains and ends the task itself; that is not a fault.
+        if not self._running or task.cancelled():
+            return
+        self._running = False
+        self.status = "error"
+        logger.warning(
+            "AssemblyAI stream ended unexpectedly: %s",
+            "error" if task.exception() else "clean exit",
+        )
+        # The callback cannot await, so the notification is scheduled. The task
+        # always has a loop because it was created from one. Holding a reference
+        # keeps it from being garbage collected mid-flight.
+        notify = asyncio.create_task(
+            self._emit(EventType.ERROR, self._friendly_stream_error(), payload={"fatal": True})
+        )
+        self._background_tasks.add(notify)
+        notify.add_done_callback(self._background_tasks.discard)
+
     # ------------------------------------------------------------- commands
     async def handle_command(self, raw: str) -> CorrectionResult:
         """Run a spoken (or typed) command. Always returns a result."""
-        command = parse_command(raw)
-        result = await self.corrections.correct(command)
+        return await self._run_command(parse_command(raw))
+
+    async def _run_command(self, command: ParsedCommand) -> CorrectionResult:
+        """Execute one command, announcing and guarding model-backed work.
+
+        The gateway call takes real time, so two things have to be true while it
+        is in flight: the UI must already show that something is happening, and
+        a second command aimed at the same line must not race it. Both are keyed
+        on the resolved subtitle id rather than the command text, so "correct the
+        last subtitle" and "fix this" colliding on the same line is caught too.
+        """
+        if not command.is_supported:
+            result = await self.corrections.correct(command)
+            await self._publish_result(command, result)
+            return result
+
+        target = self.corrections.resolve(command)
+        if target is not None and target.id in self._pending:
+            result = CorrectionResult.failure(
+                CorrectionOutcome.INVALID,
+                f'"{target.text[:60]}" is still being corrected. Wait for it to finish.',
+                backend="session",
+                subtitle_id=target.id,
+                reason=command.reason,
+            )
+            await self._publish_result(command, result)
+            return result
+
+        token = target.id if needs_model(command) and target is not None else None
+        if token is not None:
+            self._pending.add(token)
+            await self._emit(
+                EventType.CORRECTION_PENDING,
+                f"Correcting {command.describe_target()}…",
+                subtitle=target,
+                payload={
+                    "subtitle_id": target.id,
+                    "text": target.text,
+                    "target": command.describe_target(),
+                    "command": command.raw,
+                },
+            )
+        try:
+            result = await self.corrections.correct(command)
+        finally:
+            if token is not None:
+                self._pending.discard(token)
+
         await self._publish_result(command, result)
         return result
 
@@ -267,8 +418,7 @@ class ScriptoraSession:
                 payload={"reason": "voice_command"},
             )
 
-        result = await self.corrections.correct(command)
-        await self._publish_result(command, result)
+        await self._run_command(command)
 
     async def _publish_result(self, command: ParsedCommand, result: CorrectionResult) -> None:
         if result.outcome is CorrectionOutcome.APPLIED:
@@ -286,6 +436,20 @@ class ScriptoraSession:
                     else f'"{result.vocabulary_term}" will apply to the next session'
                 ),
             )
+
+        if result.outcome is CorrectionOutcome.APPLIED and result.corrected_subtitle_id:
+            # The corrected wording is a new line in the transcript, so the
+            # client has to be sent it. The correction event alone carries only
+            # the original, which would leave the screen showing the untouched
+            # line with nothing under it.
+            corrected = self.subtitles.find(result.corrected_subtitle_id)
+            if corrected is not None:
+                await self._emit(
+                    EventType.SUBTITLE,
+                    corrected.text,
+                    subtitle=corrected,
+                    payload={"partial": False},
+                )
 
         await self._emit(
             EventType.CORRECTION,
@@ -364,4 +528,17 @@ class ScriptoraSession:
         return (
             "Could not start the AssemblyAI streaming session. See the server log for "
             f"details ({type(exc).__name__})."
+        )
+
+    @staticmethod
+    def _friendly_stream_error() -> str:
+        """Explain a stream that ended mid-session, and how to recover.
+
+        Deliberately not derived from the exception: by this point the text
+        reaches the browser, so it must be safe and actionable rather than
+        specific.
+        """
+        return (
+            "Lost the connection to AssemblyAI while listening. Check your network, "
+            "then press Start Listening again to reconnect."
         )

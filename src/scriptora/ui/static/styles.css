@@ -188,6 +188,36 @@ html, body {
 .subtitle-final { border-left-color: var(--ok); }
 .subtitle-corrected { border-left-color: var(--fixed); background: rgba(53,208,127,0.07); }
 
+/* A correction is a child line: indented under the line it fixes, with a
+ * connector so the relationship is obvious without reading the log. It keeps
+ * its own "corrected" tint, which is what distinguishes the new wording from
+ * the original sitting directly above it. */
+.subtitle-correction {
+  margin-left: 14px;
+  border-left-style: dashed;
+  position: relative;
+}
+.subtitle-correction::before {
+  content: "\21B3";                 /* downwards white arrow */
+  position: absolute; left: -13px; top: 11px;
+  color: var(--fixed); font-size: 11px; line-height: 1;
+}
+
+/* A line whose correction is still with the model. The pulse is the only thing
+ * standing between "thinking about it" and "the app froze", so it animates
+ * rather than sitting still. */
+.subtitle-busy { opacity: 0.75; }
+.subtitle-busy::after {
+  content: "correcting\2026";
+  position: absolute; right: 12px; top: 10px;
+  font-family: var(--mono); font-size: 10.5px; color: var(--accent);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+@keyframes pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .subtitle-busy::after { animation: none; opacity: 1; }
+}
+
 .subtitle-foot {
   display: flex; gap: 10px; margin-top: 5px;
   font-family: var(--mono); font-size: 10.5px; color: var(--text-faint);

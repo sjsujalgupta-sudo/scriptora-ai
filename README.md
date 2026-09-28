@@ -138,7 +138,7 @@ does and does not work.
 ## Development
 
 ```bash
-pytest                 # 145 tests, no network access
+ pytest                 # 279 tests, no network access
 ruff check .
 ruff format .
 ```

@@ -45,6 +45,13 @@ _API_HOST = "streaming.assemblyai.com"
 _ERROR_HINTS = {
     1001: "Invalid AssemblyAI API key. Check ASSEMBLYAI_API_KEY in your .env file.",
     1002: "AssemblyAI rejected this key. Check ASSEMBLYAI_API_KEY in your .env file.",
+    # 1006 is the standard WebSocket "abnormal closure" code: the peer dropped
+    # the TCP connection without sending a close frame, so there is no reason
+    # text to relay. It is a transport failure, never a credential problem.
+    1006: (
+        "The AssemblyAI connection was dropped unexpectedly. Check your network, "
+        "then press Start Listening to reconnect."
+    ),
     3007: "AssemblyAI rejected an audio frame. Frames must be 50-1000 ms.",
     4001: "Too many streaming sessions. Wait a moment and try again.",
     4010: "This AssemblyAI key is not authorised for real-time streaming.",
@@ -249,4 +256,8 @@ class AssemblyAIRealtimeService:
         try:
             await client.disconnect(terminate=True)
         except Exception as exc:
-            logger.info("Error while disconnecting: %s", type(exc).__name__)
+            # WARNING, not INFO: if the termination frame never got through, the
+            # final turn was not flushed and the last words of the session are
+            # lost. The Stop summary still reports a clean stop, so this log line
+            # is the only evidence that it was not.
+            logger.warning("AssemblyAI session did not terminate cleanly: %s", type(exc).__name__)

@@ -39,7 +39,7 @@
         id="command-input"
         class="command-input"
         type="text"
-        placeholder="Type a command, e.g. Correct the last subtitle"
+            placeholder="Change the last sentence to ..."
         autocomplete="off"
         disabled
       />
@@ -78,7 +78,7 @@
             </div>
             <div class="compare-arrow" aria-hidden="true">&darr;</div>
             <div class="compare-col">
-              <span class="compare-label compare-label-fixed">AI corrected</span>
+              <span class="compare-label compare-label-fixed">Corrected</span>
               <p class="compare-text compare-fixed" id="compare-fixed"></p>
             </div>
           </div>
@@ -119,12 +119,19 @@
         </section>
 
         <section class="panel panel-commands">
-          <div class="panel-head"><h2>Voice commands</h2></div>
+          <div class="panel-head"><h2>Commands</h2></div>
+          <p class="panel-note">
+            Rewrite a line by naming it. The original stays put and the correction
+            appears underneath it.
+          </p>
           <ul class="commands">
+            <li><code>Change this to "To deployed."</code></li>
+            <li><code>Change the last sentence to "To deployed."</code></li>
+            <li><code>Change the 3rd sentence to "To deployed."</code></li>
+            <li><code>Change the previous sentence to &hellip;</code></li>
             <li><code>Correct the last subtitle</code></li>
             <li><code>Fix the previous subtitle</code></li>
             <li><code>Change fast API to FastAPI</code></li>
-            <li><code>Replace Alice with Atlas</code></li>
             <li><code>Remember FastAPI as a technical term</code></li>
           </ul>
         </section>

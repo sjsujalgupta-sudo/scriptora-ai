@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 
 import pytest
 from assemblyai.streaming.v3 import RealTimeParameters, RealTimeSessionParameters
@@ -101,6 +102,58 @@ async def test_stream_is_awaited_and_consumes_the_iterable(service):
 async def test_stream_without_a_client_is_a_no_op(service):
     """Never raises: the session may stop before AssemblyAI finished connecting."""
     await service.stream(_frames(b"a" * 3200))
+
+
+# ------------------------------------------------------------------ error hints
+@pytest.mark.parametrize(
+    "code,expected",
+    [
+        (1001, "API key"),
+        (1006, "Start Listening"),
+        (3007, "50-1000 ms"),
+    ],
+)
+async def test_known_error_codes_give_an_actionable_message(service, code, expected):
+    """A dropped connection must not be reported as a raw code.
+
+    1006 in particular is the WebSocket "abnormal closure" code - a transport
+    failure, never a credential problem, so it must not be phrased as one.
+    """
+    seen: list[tuple[str, bool]] = []
+
+    async def on_error(message: str, fatal: bool) -> None:
+        seen.append((message, fatal))
+
+    handler = service._on_error(on_error)
+    await handler(None, SimpleNamespace(code=code, __str__=lambda self: "raw text"))
+
+    assert seen, f"code {code} produced no user-facing message"
+    assert expected in seen[0][0], f"code {code}: {seen[0][0]!r}"
+    assert seen[0][1] is True
+
+
+async def test_error_1006_never_blames_the_api_key(service):
+    """The connection dropped; telling the user to check their key is wrong."""
+    seen: list[tuple[str, bool]] = []
+
+    async def on_error(message: str, fatal: bool) -> None:
+        seen.append((message, fatal))
+
+    await service._on_error(on_error)(None, SimpleNamespace(code=1006, __str__=lambda self: ""))
+    assert "API key" not in seen[0][0]
+    assert "ASSEMBLYAI_API_KEY" not in seen[0][0]
+
+
+async def test_error_messages_never_leak_credentials(service):
+    seen: list[tuple[str, bool]] = []
+
+    async def on_error(message: str, fatal: bool) -> None:
+        seen.append((message, fatal))
+
+    leaky = f"unauthorized for key {FAKE_KEY}"
+    await service._on_error(on_error)(None, SimpleNamespace(code=9999, __str__=lambda self: leaky))
+    assert seen[0][0]
+    assert FAKE_KEY not in seen[0][0]
 
 
 # --------------------------------------------------------------------- keyterms

@@ -55,6 +55,11 @@
   var connected = false;
   var seedCount = 0;         // how many vocabulary chips came from the seed set
   var seenSubtitleIds = {};
+  // Ids of lines that are corrections of another line, tracked so the count can
+  // exclude them without re-deriving the parent/child relationship each time.
+  var correctionIds = {};
+  // Lines with a correction in flight, so a busy line can be shown as busy.
+  var pendingCorrections = {};
   var logItems = 0;
 
   // Resampling state. `carry` holds fractional samples across processor calls
@@ -128,7 +133,23 @@
     var node = document.getElementById("sub-" + sub.id);
     if (node && node.parentNode) node.parentNode.removeChild(node);
     delete seenSubtitleIds[sub.id];
+    delete correctionIds[sub.id];
+    delete pendingCorrections[sub.id];
     updateCount();
+  }
+
+  function markPending(subtitleId, on) {
+    if (!subtitleId) return;
+    if (on) {
+      pendingCorrections[subtitleId] = true;
+    } else {
+      delete pendingCorrections[subtitleId];
+    }
+    var node = document.getElementById("sub-" + subtitleId);
+    // The node may not exist yet on the very first correction after a line
+    // lands; the correction event that follows renders it without the spinner,
+    // which is correct - by then the work is already finished.
+    if (node) node.classList.toggle("subtitle-busy", !!on);
   }
 
   function renderSubtitle(sub, isPartial) {
@@ -143,9 +164,18 @@
     if (!existing) {
       div.id = "sub-" + sub.id;
       seenSubtitleIds[sub.id] = true;
+      if (sub.corrects_id) {
+        correctionIds[sub.id] = true;
+        // Recorded on the node so later insertions can find the end of this
+        // line's existing corrections.
+        div.dataset.correctsId = sub.corrects_id;
+      }
     }
 
     var cls = "subtitle subtitle-" + (sub.status || (isPartial ? "partial" : "final"));
+    // A correction is a child of another line, so it is visually attached to
+    // it rather than sitting in the transcript as though it were a new one.
+    if (sub.corrects_id) cls += " subtitle-correction";
     div.className = cls;
     div.innerHTML = "";
 
@@ -174,14 +204,36 @@
     }
     div.appendChild(foot);
 
-    if (!existing) el.transcript.appendChild(div);
+    if (!existing) {
+      // A correction belongs directly beneath the line it fixes. Its reference
+      // names the original, so this needs no server-side ordering.
+      var anchor = sub.corrects_id && document.getElementById("sub-" + sub.corrects_id);
+      if (anchor && anchor.parentNode) {
+        // Step over the corrections this line already has before inserting.
+        // Inserting at anchor.nextSibling every time would put each new edit
+        // above the last, so repeated fixes would read newest-first and drift
+        // away from the line they belong to.
+        var ref = anchor.nextSibling;
+        while (ref && ref.dataset && ref.dataset.correctsId === sub.corrects_id) {
+          ref = ref.nextSibling;
+        }
+        anchor.parentNode.insertBefore(div, ref);
+      } else {
+        el.transcript.appendChild(div);
+      }
+    }
     el.transcript.scrollTop = el.transcript.scrollHeight;
 
     updateCount();
   }
 
   function updateCount() {
-    var n = Object.keys(seenSubtitleIds).length;
+    // Corrections are not sentences the user spoke. Counting them would make
+    // the number climb on every edit, and would no longer match the "sentence
+    // 3" an ordinal command resolves to on the server.
+    var n = Object.keys(seenSubtitleIds).filter(function (id) {
+      return !correctionIds[id];
+    }).length;
     el.subtitleCount.textContent = n === 1 ? "1 line" : n + " lines";
   }
 
@@ -412,14 +464,28 @@
         if (msg.payload && msg.payload.vocabulary) renderVocabulary(msg.payload.vocabulary);
         break;
 
+      case "correction_pending":
+        // The gateway call is the slow part of a correction. Showing the line as
+        // busy immediately is what stops the UI looking frozen while the user
+        // keeps talking.
+        markPending(msg.payload && msg.payload.subtitle_id, true);
+        logActivity(msg.message, null);
+        break;
+
       case "correction": {
         var r = msg.payload || {};
+        // Always clear the busy state, whatever the outcome: a refusal or a
+        // no-action is still the end of the wait.
+        markPending(r.subtitle_id, false);
         if (msg.subtitle) renderSubtitle(msg.subtitle, false);
         if (r.outcome === "applied") {
           logActivity(msg.message + (r.reason ? " - " + r.reason : ""), "ok");
           showComparison(r);
         } else if (r.outcome === "no_action") {
-          logActivity(msg.message, null);
+          // Show the reason too. "No correction was needed" on its own reads
+          // like the subtitle is correct, when the usual cause is that the
+          // model had nothing to correct *towards*.
+          logActivity(msg.message + (r.reason ? " - " + r.reason : ""), null);
         } else {
           logActivity(msg.message, "err");
         }

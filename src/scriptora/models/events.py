@@ -21,6 +21,9 @@ class EventType(str, Enum):
     SUBTITLE = "subtitle"
     SUBTITLE_REMOVED = "subtitle_removed"
     CORRECTION = "correction"
+    # A correction has been accepted and is awaiting the model. Sent before the
+    # gateway call so the UI can show progress instead of appearing to hang.
+    CORRECTION_PENDING = "correction_pending"
     CONTEXT = "context"
     ACTIVITY = "activity"
     ERROR = "error"

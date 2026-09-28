@@ -50,6 +50,16 @@ class Subtitle(BaseModel):
     # a raw-vs-corrected comparison.
     raw_text: str | None = None
 
+    # Set on a subtitle that is a correction *of another line*, naming that
+    # line's id. A correction is a child: the original stays exactly as
+    # AssemblyAI produced it, and the corrected wording is inserted immediately
+    # after it, so the transcript keeps showing what was actually heard.
+    corrects_id: str | None = None
+
+    @property
+    def is_correction(self) -> bool:
+        return self.corrects_id is not None
+
     def finalize(self, text: str | None = None, end_time: int | None = None) -> None:
         """Promote a partial subtitle to final.
 
@@ -67,10 +77,13 @@ class Subtitle(BaseModel):
             self.end_time = _now_ms()
 
     def apply_correction(self, replacement_text: str) -> None:
-        """Apply a validated correction.
+        """Rewrite this line in place.
 
-        `raw_text` preserves the original transcript, enabling the RAW vs
-        CORRECTED comparison panel.
+        Superseded by `SubtitleService.correct_as_child`, which leaves the
+        original intact and inserts the corrected wording after it. Kept because
+        the in-place path is still the right behaviour for a *partial* line:
+        there is nothing yet to show as "what was heard", and a half-finished
+        utterance should not leave a stale duplicate behind.
         """
         replacement_text = replacement_text.strip()
         if not replacement_text:

@@ -80,6 +80,37 @@ class SubtitleService:
     def finalized(self) -> list[Subtitle]:
         return [item for item in self._items if not item.is_provisional]
 
+    def originals(self) -> list[Subtitle]:
+        """Finalized lines that are *not* corrections of another line.
+
+        Every "which line?" question - this, last, previous, the third sentence -
+        must be answered against this list. Corrections are interleaved in
+        `_items` so the UI can render them under their original, which means
+        counting `_items` directly would let a correction answer "the third
+        sentence" and shift every later ordinal.
+        """
+        return [item for item in self._items if not item.is_provisional and not item.is_correction]
+
+    def last_original(self) -> Subtitle | None:
+        lines = self.originals()
+        return lines[-1] if lines else None
+
+    def previous_original(self) -> Subtitle | None:
+        """The line before the most recent original."""
+        lines = self.originals()
+        return lines[-2] if len(lines) >= 2 else None
+
+    def original_at(self, ordinal: int) -> Subtitle | None:
+        """The `ordinal`-th original line, 1-based. None when out of range."""
+        if ordinal < 1:
+            return None
+        lines = self.originals()
+        return lines[ordinal - 1] if ordinal <= len(lines) else None
+
+    def corrections_of(self, subtitle_id: str) -> list[Subtitle]:
+        """Corrections attached to one line, in the order they were made."""
+        return [item for item in self._items if item.corrects_id == subtitle_id]
+
     def recent(self, limit: int = 3) -> list[str]:
         """Most recent finalized texts, newest first - LLM context window."""
         return [item.text for item in reversed(self.finalized())][:limit]
@@ -152,6 +183,49 @@ class SubtitleService:
         subtitle = self.get(subtitle_id)
         subtitle.apply_correction(replacement_text)
         return subtitle
+
+    def correct_as_child(self, subtitle_id: str, replacement_text: str) -> Subtitle:
+        """Record a correction as a new line directly after its original.
+
+        The original's `text` is never touched: what AssemblyAI heard stays in
+        the transcript, and the corrected wording is a separate child that
+        references it. That is what lets the UI show both, and what keeps
+        "change the 3rd sentence" addressing the same line it did before any
+        correction existed.
+
+        A partial line is still corrected in place, because it is a live
+        utterance with nothing settled to preserve and inserting a sibling would
+        leave a duplicate behind.
+        """
+        replacement_text = (replacement_text or "").strip()
+        if not replacement_text:
+            raise ValueError("replacement_text must not be empty")
+
+        original = self.get(subtitle_id)
+        if original.is_provisional:
+            original.apply_correction(replacement_text)
+            return original
+
+        child = Subtitle(
+            text=replacement_text,
+            status=SubtitleStatus.CORRECTED,
+            turn_order=original.turn_order,
+            # The comparison panel reads before/after; carrying the original
+            # text on the child keeps that working without another lookup.
+            raw_text=original.text,
+            corrects_id=original.id,
+        )
+        child.end_time = original.end_time or child.start_time
+        # Insert after this line's existing corrections rather than straight
+        # after the original. Inserting at the original's index every time
+        # would put the newest correction first, so the transcript and
+        # corrections_of() would list the edits in reverse.
+        insert_at = self._items.index(original) + 1
+        while insert_at < len(self._items) and self._items[insert_at].corrects_id == original.id:
+            insert_at += 1
+        self._items.insert(insert_at, child)
+        self._trim()
+        return child
 
     def remove(self, subtitle_id: str) -> None:
         """Drop a subtitle.
