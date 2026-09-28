@@ -73,17 +73,24 @@ class ParsedCommand:
 # parses identically to "Correct the last subtitle."
 _FILLER = re.compile(r"[,\s]*(?:please|now|okay|ok|thanks|thank you)\s*[.!?]*\s*$", re.IGNORECASE)
 
+# The nouns a person uses for a transcript line. Defined once, here, so the
+# correction rules and the target grammar below cannot drift apart: they each
+# used their own list, and "sentence" was in one but not the other. A live
+# rehearsal said "Correct the last sentence." and got silence, because the
+# target half understood "sentence" and the rule half did not.
+_LINE_NOUN = r"(?:sentence|subtitle|line|caption|transcript)"
+
 _LAST = re.compile(
     r"^(?:correct|fix)(?:\s+(?:the|that|this))?\s+"
     r"(?:last|current|latest|newest|most\s+recent)\s+"
-    r"(?:subtitle|caption|line|transcript|one|text)\b",
+    rf"(?:{_LINE_NOUN}|one|text)\b",
     re.IGNORECASE,
 )
 
 _PREVIOUS = re.compile(
     r"^(?:correct|fix|redo|revisit)\s+(?:the\s+)?"
     r"(?:previous|prior|preceding|above|last\s+one\s+but\s+one)\s+"
-    r"(?:subtitle|caption|line|transcript|one|text)\b",
+    rf"(?:{_LINE_NOUN}|one|text)\b",
     re.IGNORECASE,
 )
 
@@ -164,10 +171,6 @@ def _strip_filler(text: str) -> str:
 _MAX_NAMED_TERM = 40
 _MAX_NAMED_TERM_WORDS = 3
 
-# The nouns a person uses for a transcript line. All of them mean the same thing
-# to the user, so they all resolve to the same target.
-_LINE_NOUN = r"(?:sentence|subtitle|line|caption|transcript)"
-
 # "third", "3rd", "3" all name position 3. Spoken commands rarely use digits,
 # but a typed one usually does, and both must land on the same line.
 _WORD_ORDINALS = (
@@ -205,10 +208,19 @@ _TARGET = (
 # sentence containing "to" ("to deployed") survives intact. The verb deliberately
 # excludes "correct"/"fix": those ask the model *what* the line should be and are
 # handled by the vocabulary-driven rules above.
+#
+# The delimiter is followed by "any run of whitespace and pause punctuation"
+# rather than whitespace alone. A recogniser punctuating dictation normally puts
+# a comma after the word "to" ("change the last sentence to, we deployed it"),
+# and a live rehearsal showed that silently killing an otherwise valid command.
+# Only the delimiter's own trailing marks are eaten; punctuation after the first
+# real character belongs to the replacement and is left alone.
+_DELIMITER_TAIL = r"[\s,:;]*"
+
 _SET_TEXT = re.compile(
     r"^(?:please\s+)?(?:change|replace|rewrite|make|set|put)\s+"
     rf"(?P<target>{_TARGET})\s+"
-    r"(?:to|with|into|as|for)\s+"
+    rf"(?:to|with|into|as|for){_DELIMITER_TAIL}"
     r"(?P<replacement>.+)$",
     re.IGNORECASE,
 )
@@ -218,7 +230,7 @@ _SET_TEXT = re.compile(
 _SET_TEXT_FROM = re.compile(
     r"^(?:please\s+)?(?:change|replace|rewrite|make|set|put)\s+"
     rf"(?P<target>{_TARGET})\s+"
-    r"from\s+.+?\s+to\s+"
+    rf"from\s+.+?\s+to{_DELIMITER_TAIL}"
     r"(?P<replacement>.+)$",
     re.IGNORECASE,
 )

@@ -1,14 +1,92 @@
 # Demo script
 
-A 90-second demo that runs on the real AssemblyAI API, plus an honest account
+A ~90-second demo that runs on the real AssemblyAI API, plus an honest account
 of which parts to trust on stage.
+
+## Run of show
+
+The short version. Everything after this section is reference material.
+
+The clock below is **wall-clock including your pauses and narration**, not
+application latency. Scriptora's own actions in this sequence take about 20
+seconds; the rest is you talking between beats. Treat the app as instant and the
+times as pacing cues.
+
+| # | You say / do | What appears | Wall clock |
+|---|---|---|---|
+| 1 | **Start Listening** | Status → Listening, waveform moves | 0:00 |
+| 2 | *"We deployed the application on Qwen clusters."* | `We deployed the application on Quen clusters.` | 0:05 |
+| 3 | Pause, then *"Correct the last subtitle."* | Line pulses, log: `Correcting the last sentence…` | 0:15 |
+| 4 | — | `↳ We deployed the application on Qwen clusters.` appears **under** the original | 0:20 |
+| 5 | *"Change the last subtitle to We deployed it to Qwen clusters."* | A second `↳` line, immediately below the first | 0:30 |
+| 6 | *"We also store the transcripts in PostgreSQL."* | New line appears **while the previous work settled** | 0:40 |
+| 7 | **Stop** | `Session ended` + final transcript | 0:50 |
+| 8 | Point at the two `↳` lines | *"The original is still there. That's the point."* | 0:55 |
+
+### Demo script vs. everything you can say
+
+The wording in the table is chosen for **reliability on stage**, not because
+Scriptora only understands it. These are all equally valid:
+
+- **Beat 3** — the app treats *sentence*, *subtitle*, *line*, and *caption* as
+  the same thing, so *"Correct the last sentence."*, *"Fix the last subtitle."*
+  and *"Fix the last line."* all do beat 3. The script uses *"subtitle"* only
+  because it is the phrasing with the most rehearsal history behind it.
+- **Beat 5** — say it **without quotation marks**. The recogniser sometimes puts
+  a comma after *to* (*"change the last subtitle to, we deployed it…"*), and
+  Scriptora ignores punctuation there on purpose, so both forms work. Quoted
+  text is still honoured exactly if you type it instead of saying it.
+
+If you memorise nothing else: you can refer to a transcript line as a
+**sentence** or a **subtitle** interchangeably, and you never have to learn a
+vocabulary.
+
+Land these three sentences, in this order:
+
+- *"AssemblyAI hears words. It doesn't know what you meant."*
+- *"The corrector fixes likely mishearings — using project context and its own knowledge of real tools."*
+- *"It never overwrites what you said. The original stays, the fix sits under it."*
+
+### Why these lines
+
+Measured against the live API, so the beats are not guesses:
+
+- **"Qwen" is reliably misheard as "Quen".** Tested with a voice pronouncing
+  *Qwen* correctly — the recognizer still returned `Quen`. The mishearing is
+  the recognizer's, not your delivery, so beat 2 and beat 4 will happen.
+- **"Qwen" is deliberately not in project context.** That is the stronger
+  version of the demo: the corrector is not copying a spelling you supplied, it
+  is recognising that `Quen` is not a real thing and `Qwen` is.
+- **Do not build a beat on "assembly AI".** AssemblyAI normalises the casing
+  and spacing itself (`assembly AI` → `AssemblyAI`), so there is nothing left
+  for the corrector to do. Verified: the transcript already reads `AssemblyAI`
+  before any correction runs.
+- **PostgreSQL transcribes correctly**, which is why it is a good beat 6 — it
+  proves the system is not rewriting everything.
+
+### When a beat does not land
+
+If beat 3 produces *"No correction was needed"* or nothing at all, the gateway
+did not answer. Do not retry it live — go straight to beat 5, which is
+deterministic and cannot fail, and say:
+
+> *"That one's already right. Here's me telling it the exact wording instead —
+> this path never calls a model, so it returns instantly."*
+
+The demo still lands, because beat 5 is the same inline-result UI. The
+difference is only which line of code produced it, and that is a better
+answer than a visible stall.
+
+Two things genuinely fail on stage and are worth pre-checking: microphone
+permission, and the LLM gateway rate limit (`429`) if you have been testing
+repeatedly in the same hour.
 
 ## Setup before you present
 
 ```bash
 pip install -e ".[dev]"
 copy .env.example .env      # add your ASSEMBLYAI_API_KEY
- pytest                     # 279 passing, no network
+pytest                      # 311 passing, no network
 python -m scriptora.main
 ```
 
@@ -143,19 +221,27 @@ original wording and the fix.
 
 | Which line | Accepted phrasings |
 |---|---|
-| The one just spoken | "this", "that", "this sentence", "the last sentence", "the last line", "the last subtitle", "the last one" |
+| The one just spoken | "this", "that", "this sentence", "the last sentence", "the last line", "the last subtitle", "the last caption", "the last one" |
 | The one before it | "the previous sentence", "the previous subtitle", "the prior line", "the preceding caption", "the last but one", "the second to last" |
 | A numbered one | "sentence 3", "subtitle 3", "the 3rd sentence", "the 22nd line", "the second sentence", "the third caption" |
 
-So all of these do the same thing:
+**Sentence, subtitle, line and caption are the same word to Scriptora.** Say
+whichever sounds natural to you — that equivalence holds for the whole command
+language, not just for rewrites. So all of these do the same thing:
 
 > Change this to "To deployed." · Change the last sentence to "To deployed." ·
-> Change sentence 3 to "To deployed." · Change the 3rd line to "To deployed."
+> Change the last subtitle to "To deployed." · Change sentence 3 to "To
+> deployed." · Change the 3rd line to "To deployed."
 
 Useful details:
 
 - **Quoted text is used exactly as typed**, punctuation included. Speech-to-text
   drops quotation marks, so an unquoted replacement works too.
+- **A pause after *to* is fine.** Speech-to-text punctuates dictation, so
+  *"change the last sentence to, we deployed it"* and *"change the last
+  sentence to we deployed it"* both work. Only the punctuation acting as the
+  delimiter is ignored — commas inside the new text are kept, so
+  *"change the last sentence to, Hello, world."* still produces `Hello, world.`
 - **No model is consulted.** You already said what the line should be, so the
   rewrite is applied immediately. This is the fastest correction in the app and
   the one that cannot go wrong creatively.
@@ -175,12 +261,27 @@ what you have actually said.
 | Say | Effect |
 |---|---|
 | "Change X to Y." | Find-and-replace inside the last line. Distinct from the above: this one looks for `X` in the text. |
-| "Correct the last subtitle." | Let the model repair the newest line, using project vocabulary plus its own knowledge of well-known technical terms. |
+| "Correct the last subtitle." or "Correct the last sentence." | Let the model repair the newest line, using project vocabulary plus its own knowledge of well-known technical terms. |
 | "Correct the last subtitle, it's X." | Fix it using X as the spelling. Works when X is a real word the model recognises — whether the difference is spacing/case (`fast API`) or a mishearing (`Quen` → `Qwen`). It will not truncate a real word: `Kubernete` will not replace `Kubernetes`. |
-| "Correct the previous subtitle." | Fix the line before the last. |
+| "Correct the previous subtitle." or "Correct the previous sentence." | Fix the line before the last. |
 | "Add X to the vocabulary" | Add X to project context and push it to AssemblyAI. |
 | "Remember X as a technical term." | Same, but the word may be misheard inside the command. |
-| Anything else | Reported honestly as unsupported. |
+| Anything else | Reported honestly as unsupported, **and the line is pulled off the transcript** so an instruction never sits there looking like content. |
+
+### If Scriptora does not understand a command
+
+An instruction it cannot carry out is **withdrawn from the transcript and
+explained in the activity log** — never silently dropped, and never applied to
+a line you did not mean. Example: *"Change the last thing to hello."* cannot
+resolve *thing* to a line, so the activity log reads:
+
+> I could not tell which line to change. Try "change the last sentence to …",
+> "change the previous sentence to …", or "change sentence 3 to …".
+
+Nothing is called, nothing is rewritten, and the line you were aiming at is
+untouched. Ordinary sentences that merely *contain* a command word are left
+alone: *"I need to remember to lock the door"* stays in the transcript as
+something you said, because it is not shaped like an instruction.
 
 ### While a correction is in flight
 
@@ -202,6 +303,13 @@ Checked against the live API, not assumed:
 - Frame sizes and format are accepted (errors 3006 / 3007 gone).
 - `Change Kubernetes to Kubernete` applies via the deterministic corrector.
 - A spoken command is detected, executed, and **withdrawn** from the transcript.
+- **The full 8-beat run of show was rehearsed end to end** through the real
+  websocket audio path into real AssemblyAI, in one continuous session. That
+  rehearsal is what surfaced three bugs, all now fixed and re-verified live:
+  *"Correct the last sentence."* was silently ignored; a comma after *to* killed
+  a dictated rewrite; and an unparsed command was left in the transcript as if
+  it were content. A clean run of the sequence takes about 20 s of application
+  time.
 - Adding a term reaches the open session (`set_params` awaited and confirmed).
 - Audio reaches AssemblyAI at exactly 1x real time. Measured over a sustained
   live session: 200 s of audio sent produced `AssemblyAI session ended after
@@ -215,6 +323,14 @@ Checked against the live API, not assumed:
 - A wrong-letter mishearing is repaired by the model **without** the term being
   in the vocabulary. Verified live: `Quen.` → `Qwen.`, `applied via llm`, with
   the project vocabulary left as AssemblyAI / Python / Atlas / PostgreSQL.
+- `Qwen` is misheard as `Quen` by `universal-3-5-pro` even when pronounced
+  correctly, so the demo's mishearing does not depend on how you speak. Verified
+  by streaming synthesised audio of a correctly pronounced "Qwen clusters": the
+  transcript came back `Quen clusters`.
+- Not every suspected mishearing is one. Verified in the same session:
+  `assembly AI` was normalised to `AssemblyAI` by AssemblyAI itself, and
+  `PostgreSQL` came back correct. Both were left alone by the corrector, which is
+  the behaviour you want — but it also means they make poor demo beats.
 - The repair is general, not a lookup: unrelated mishearings
   (`kubernetties`, `kubernets`) resolve the same way, and there is no Qwen rule
   anywhere in the codebase.
@@ -226,6 +342,26 @@ Checked against the live API, not assumed:
 - Unsupported commands are reported, not guessed — including a `change ... to ...`
   whose target line cannot be identified, which is refused rather than applied to
   the wrong line.
+- **A spoken command that cannot be parsed now produces visible feedback.** This
+  was the rehearsal's worst finding: *"Correct the last sentence."* matched the
+  voice gate, failed to parse, and was dropped on the floor, so the instruction
+  sat in the transcript looking like content and the user heard nothing. Verified
+  live: *"Change the last thing to hello."* is now withdrawn from the transcript
+  and answered in the activity log with the three accepted target phrasings, with
+  no model call and no line mutated.
+- **"Sentence" and "subtitle" are interchangeable everywhere**, not just in
+  rewrites. They used to be two separate vocabularies — the target grammar knew
+  *sentence* and the correction rules did not — which is exactly how the silent
+  failure above happened. There is now a single source of truth. Verified live:
+  spoken *"Correct the last sentence."* reaches the model and applies.
+- **A dictated rewrite survives the recogniser's punctuation.** Verified live:
+  spoken *"Change the last sentence to, we deployed it to Qwen clusters."*
+  (with the comma) applies deterministically via `rules`, and punctuation inside
+  the replacement is still preserved.
+- **Prose containing a command word is not a command.** *"I need to remember to
+  lock the door"* and *"We should change the configuration"* both stay in the
+  transcript. The voice gate matches an instruction only from the start of the
+  utterance, which is what makes reporting an unparsed command safe.
 
 Still to confirm with a real microphone before claiming it on stage:
 
@@ -233,14 +369,11 @@ Still to confirm with a real microphone before claiming it on stage:
   same spoken audio transcribed as `Kubernetes` before the term is added and as
   `Kubernete` after. The mechanism is verified (the parameter reaches the open
   session); the before/after difference in a spoken sentence is not.
-- **Everything in the "Rewriting a line" section is covered by the test suite but
-  has not been spoken aloud yet.** The parser, the target resolution, the
-  original-preserving child line, and the line count are verified in-process. What
-  a microphone would add is the part no unit test can reach: that AssemblyAI
-  transcribes *"change the third sentence to to deployed"* as something the
-  parser still recognises. That is the single most likely thing to need a tweak
-  before you rely on it on stage, because the dictated wording is the input the
-  test suite has to assume.
+- **Ordinals have been spoken aloud, but only in tests.** *"Change the third
+  sentence to …"* is covered in-process, including that corrections never
+  renumber, and ordinal targeting is far less fragile than the last/previous
+  forms because digits survive transcription intact. A real microphone pass
+  would still be worth doing before you lean on it.
 - **The busy-line indicator has not been seen while a real request is in
   flight.** The ordering that matters — the pending event is emitted before the
   gateway call, and the busy state clears on every outcome including a refusal —

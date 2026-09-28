@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -61,6 +62,11 @@ _COMMANDS: tuple[tuple[CommandKind, tuple[str, ...]], ...] = (
         ("rewrite ", "rewrite\u00a0", "make ", "set ", "put "),
     ),
 )
+
+# Politeness allowed *before* the command verb. Kept in step with the parser,
+# which also tolerates exactly one leading "please", so the voice gate can never
+# accept a phrase the parser then rejects.
+_LEADING_POLITENESS = re.compile(r"^please\s+", re.IGNORECASE)
 
 
 class ScriptoraSession:
@@ -395,19 +401,34 @@ class ScriptoraSession:
 
     async def _maybe_run_command(self, turn_text: str) -> None:
         """Treat a finalized turn as a command when it clearly is one."""
-        lowered = turn_text.strip().lower()
-        if not any(prefix in lowered for _kind, prefixes in _COMMANDS for prefix in prefixes):
+        # The gate is loose about wording but strict about shape: a command is an
+        # instruction, so it *begins* with the verb. Matching the keyword
+        # anywhere in the sentence made ordinary dictation ("I need to remember
+        # to lock the door") look like a command, and quietly swallowing a
+        # transcript line is far worse than the false negatives this avoids.
+        # Only the leading "please" is tolerated, because that is the sole piece
+        # of politeness the parser also accepts - so the gate can never fire on
+        # something the parser would then reject as a command.
+        lowered = _LEADING_POLITENESS.sub("", turn_text.strip().lower())
+        if not any(
+            lowered.startswith(prefix) for _kind, prefixes in _COMMANDS for prefix in prefixes
+        ):
             return
 
         command = parse_command(turn_text)
-        if not command.is_supported:
-            # Only report "unsupported" when it really looked like a command.
-            return
 
         # A command is an instruction, not a subtitle, so it must not become a
         # transcript line. The subtitle event has already gone out by now, so
         # tell the browser to drop the row too - otherwise the command lingers
         # on screen forever even though it is gone from state.
+        #
+        # This runs for an unparseable command too, and deliberately so. Text
+        # only reaches here once it has cleared the command gate above, so the
+        # speaker was plainly trying to issue a command; an unparsed one is
+        # still an instruction that was not carried out, and leaving it in the
+        # transcript as though it were content is the worst possible reading of
+        # it. `_run_command` answers UNSUPPORTED with a result and no model call,
+        # so the user is told what happened instead of hearing nothing.
         last = self.subtitles.last()
         if last is not None and last.text.strip() == turn_text.strip():
             self.subtitles.remove(last.id)

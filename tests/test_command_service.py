@@ -390,3 +390,138 @@ def test_needs_model_is_true_only_for_correction_questions():
     assert needs_model(parse_command("Change fast API to FastAPI")) is False
     assert needs_model(parse_command("Change sentence 3 to To deployed.")) is False
     assert needs_model(parse_command("Remember FastAPI")) is False
+
+
+# ==================================================== natural "sentence" support
+#
+# A live rehearsal said "Correct the last sentence." and got silence. The target
+# grammar knew the word "sentence" and the correction rules had their own,
+# older noun list that did not, so the phrase parsed as UNSUPPORTED and the user
+# was told nothing. These pin the two vocabularies to one source.
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Correct the last sentence.",
+        "Correct the last subtitle.",
+        "Fix the last sentence.",
+        "Fix the last subtitle.",
+    ],
+)
+def test_sentence_and_subtitle_are_interchangeable_for_the_last_line(phrase):
+    command = parse_command(phrase)
+    assert command.kind is CommandKind.CORRECT_LAST
+    assert command.target is CorrectionTarget.LAST
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Fix the previous sentence.",
+        "Fix the previous subtitle.",
+        "Correct the previous sentence.",
+        "Correct the previous subtitle.",
+    ],
+)
+def test_sentence_and_subtitle_are_interchangeable_for_the_previous_line(phrase):
+    command = parse_command(phrase)
+    # Which line it names is carried by the *kind*; the resolver branches on
+    # that and looks up `previous_original()`.
+    assert command.kind is CommandKind.CORRECT_PREVIOUS
+
+
+@pytest.mark.parametrize(
+    "noun",
+    ["sentence", "subtitle", "line", "caption"],
+)
+def test_every_line_noun_resolves_to_the_same_last_target(noun):
+    command = parse_command(f"Change the last {noun} to To deployed.")
+    assert command.kind is CommandKind.SET_TEXT
+    assert command.target is CorrectionTarget.LAST
+    assert command.replace == "To deployed."
+
+
+def test_a_correction_question_named_in_a_sentence_still_extracts_its_term():
+    """The synonym must not cost us the answer the user dictated with it."""
+    command = parse_command("Correct the last sentence. It's FastAPI.")
+
+    assert command.kind is CommandKind.CORRECT_LAST
+    assert command.find == "FastAPI"
+
+
+# ================================================ transcription punctuation
+#
+# AssemblyAI punctuated a dictated command as "change the last sentence to, we
+# deployed it", and the comma silently invalidated an otherwise perfect command.
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Change the last sentence to We deployed it.",
+        "Change the last sentence to, We deployed it.",
+        "Change the last sentence to: We deployed it.",
+        "Change the last subtitle to We deployed it.",
+        "Change the last sentence with We deployed it.",
+        "Change the last sentence with, We deployed it.",
+    ],
+)
+def test_pause_punctuation_after_the_delimiter_is_ignored(phrase):
+    command = parse_command(phrase)
+    assert command.kind is CommandKind.SET_TEXT
+    assert command.target is CorrectionTarget.LAST
+    assert command.replace == "We deployed it."
+
+
+def test_punctuation_inside_the_replacement_is_never_stripped():
+    """Only the delimiter's own marks go; the speaker's own stay."""
+    command = parse_command('Change the last sentence to: "Hello, world."')
+
+    assert command.kind is CommandKind.SET_TEXT
+    assert command.replace == "Hello, world."
+
+
+def test_an_unquoted_replacement_keeps_its_internal_punctuation():
+    command = parse_command("Change the last sentence to, Hello, world.")
+
+    assert command.kind is CommandKind.SET_TEXT
+    assert command.replace == "Hello, world."
+
+
+def test_a_spelled_out_delimiter_with_a_comma_resolves_like_the_typed_form():
+    """Spoken and typed must converge on the same target and replacement.
+
+    A second spoken-only grammar would be the place for these two to drift.
+    """
+    spoken = parse_command("Change the last sentence to, we deployed it to Qwen clusters.")
+    typed = parse_command('Change the last sentence to "We deployed it to Qwen clusters."')
+
+    assert spoken.kind is typed.kind is CommandKind.SET_TEXT
+    assert spoken.target is typed.target
+    assert spoken.ordinal == typed.ordinal
+    # Case aside, the dictated and typed forms name the same new line.
+    assert spoken.replace.casefold() == typed.replace.casefold()
+
+
+def test_the_from_to_form_also_tolerates_a_delimiter_comma():
+    command = parse_command("Change the last sentence from Quen to, Qwen clusters.")
+
+    assert command.kind is CommandKind.SET_TEXT
+    assert command.replace == "Qwen clusters."
+
+
+def test_a_rewrite_with_no_replacement_is_still_refused():
+    """The looser delimiter must not let an empty replacement through."""
+    command = parse_command("Change the last sentence to")
+
+    assert command.is_supported is False
+
+
+def test_the_new_punctuation_tolerance_cannot_shadow_a_find_replace():
+    """`Change X to Y` must not be captured as a target-based rewrite."""
+    command = parse_command("Change fast API to FastAPI")
+
+    assert command.kind is CommandKind.REPLACE
+    assert command.find == "fast API"
+    assert command.replace == "FastAPI"

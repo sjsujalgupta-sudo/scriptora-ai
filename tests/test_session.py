@@ -1121,3 +1121,150 @@ async def test_the_transcript_count_ignores_corrections(stub):
     await session.handle_command('Change sentence 1 to "One, revised."')
     assert len(session.subtitles) == 4
     assert len(session.subtitles.originals()) == 3
+
+
+# ================================================ unsupported spoken commands
+#
+# The rehearsal's worst finding: "Correct the last sentence." passed the voice
+# gate, failed to parse, and was then dropped on the floor. The instruction
+# stayed on screen as though it were a transcript line and the user got silence.
+# An uncarried instruction must never be indistinguishable from content.
+
+
+async def test_an_unsupported_spoken_command_is_withdrawn_and_explained(stub):
+    """Gate says command, parser says no: say so, do not stay silent."""
+    session, events = make_session()
+    await session.start()
+    session.subtitles.add("we deployed the application on Quen clusters").finalize()
+
+    # Passes the gate ("change ...") but names a line we cannot resolve.
+    await stub.last.emit_final("Change the last thing to hello.")
+
+    removals = events_of(events, EventType.SUBTITLE_REMOVED)
+    assert removals, "an uncarried command must be pulled off the transcript"
+    assert removals[-1]["payload"]["reason"] == "voice_command"
+
+    # The command must not linger as a subtitle.
+    assert all("hello" not in s.text for s in session.subtitles)
+
+    # And the user must be told, not left guessing.
+    corrections = events_of(events, EventType.CORRECTION)
+    assert corrections, "an unsupported spoken command must produce feedback"
+    assert corrections[-1]["payload"]["outcome"] == CorrectionOutcome.UNSUPPORTED.value
+    assert corrections[-1]["payload"]["message"]
+
+
+async def test_an_unsupported_spoken_command_changes_nothing(stub):
+    """No model call, and above all no mutation of the line it aimed at."""
+    session, events = make_session()
+    await session.start()
+    sub = session.subtitles.add("we deployed the application on Quen clusters")
+    sub.finalize()
+
+    with patch("httpx.AsyncClient.post") as post:
+        await stub.last.emit_final("Change the last thing to hello.")
+
+    assert post.call_count == 0, "an unsupported command must not reach the model"
+    assert session.subtitles.get(sub.id).text == sub.text
+    assert len(session.subtitles) == 1
+    assert not events_of(events, EventType.CORRECTION_PENDING)
+
+
+async def test_ordinary_dictation_containing_a_command_word_is_left_alone(stub):
+    """The gate must not fire on prose that merely contains a keyword.
+
+    Anchoring the gate to the start of the utterance is what makes reporting an
+    unparsed command safe: without it, "I need to change the config" would be
+    withdrawn from the transcript.
+    """
+    session, events = make_session()
+    await session.start()
+
+    for spoken in (
+        "I need to remember to lock the door before I leave.",
+        "We should change the configuration before shipping.",
+    ):
+        await stub.last.emit_final(spoken)
+
+    assert len(session.subtitles) == 2
+    assert not events_of(events, EventType.SUBTITLE_REMOVED)
+    assert not events_of(events, EventType.CORRECTION_PENDING)
+
+
+# ================================================ natural spoken corrections
+#
+# The two exact phrases that failed live, verified end to end through the real
+# voice path: the sentence/subtitle synonym, and a comma the transcriber put
+# after "to".
+
+
+async def test_a_spoken_sentence_correction_reaches_the_model(stub):
+    session, _events = make_session()
+    await session.start()
+    sub = session.subtitles.add("we deployed the application on Quen clusters")
+    sub.finalize()
+
+    with patch("httpx.AsyncClient.post", return_value=_gateway_says(sub.id, "Qwen.")) as post:
+        await stub.last.emit_final("Correct the last sentence.")
+
+    assert post.call_count == 1, "the model must actually be consulted"
+    assert corrected_text(session, sub.id) == "Qwen."
+    assert session.subtitles.get(sub.id).text == "we deployed the application on Quen clusters"
+
+
+async def test_a_spoken_command_with_a_comma_after_to_still_rewrites_the_line(stub):
+    """AssemblyAI punctuated this as "...to, we deployed it". It must still work."""
+    session, _events = make_session()
+    await session.start()
+    sub = session.subtitles.add("we deployed the application on Qwen clusters")
+    sub.finalize()
+
+    with patch("httpx.AsyncClient.post") as post:
+        await stub.last.emit_final("Change the last sentence to, we deployed it to Qwen clusters.")
+
+    assert post.call_count == 0
+    assert corrected_text(session, sub.id) == "we deployed it to Qwen clusters."
+
+
+async def test_a_spoken_command_does_not_call_the_model(stub):
+    """A dictated rewrite is already the answer, so the gateway is pointless."""
+    session, _events = make_session()
+    await session.start()
+    sub = session.subtitles.add("we deployed the application on Qwen clusters")
+    sub.finalize()
+
+    with patch("httpx.AsyncClient.post") as post:
+        await stub.last.emit_final('Change the last sentence to "We deploy it on Friday."')
+
+    assert post.call_count == 0, "a literal rewrite must stay deterministic"
+    assert corrected_text(session, sub.id) == "We deploy it on Friday."
+
+
+async def test_ordinals_still_count_originals_after_two_corrections(stub):
+    """Corrections are not sentences the user spoke, so they must not renumber.
+
+    "the third sentence" has to keep meaning the third thing the user said even
+    once two children have been inserted underneath the second.
+    """
+    session, _events = make_session()
+    await session.start()
+    for text in ("First line.", "Second line.", "Third line."):
+        session.subtitles.add(text).finalize()
+    second, third = session.subtitles.originals()[1:3]
+
+    await session.handle_command("Change sentence 2 to Second, revised once.")
+    await session.handle_command("Change sentence 2 to Second, revised twice.")
+
+    assert len(session.subtitles) == 5
+    assert len(session.subtitles.originals()) == 3
+
+    await stub.last.emit_final("Change the third sentence to Rewritten three.")
+
+    # `corrected_text` insists on exactly one child, so read the newest directly:
+    # a second revision must not displace the first in the ordering.
+    assert [c.text for c in session.subtitles.corrections_of(third.id)] == ["Rewritten three."]
+    assert [c.text for c in session.subtitles.corrections_of(second.id)] == [
+        "Second, revised once.",
+        "Second, revised twice.",
+    ]
+    assert session.subtitles.get(second.id).text == "Second line."
