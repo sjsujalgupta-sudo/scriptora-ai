@@ -1405,3 +1405,121 @@ def test_the_prompt_explains_the_two_meanings_of_a_named_term():
     assert "user_named_term" in prompt
     assert "believe is wrong" in prompt
     assert "believe is right" in prompt
+
+
+# ================= named mistake vs project vocabulary, end to end ==========
+# Live demo bug: AssemblyAI heard "QEMU" for the user's "Qwen". QEMU is a real
+# technical term, so the old "only fix clear mishearings" guidance made the
+# model decline even after Qwen was added to the project vocabulary. The fix is
+# a prompt tier telling the model to weigh the user-named mistake against
+# project_vocabulary - NOT a hard-coded QEMU -> Qwen mapping.
+
+
+async def test_a_vocabulary_candidate_is_in_the_model_input_for_a_named_mistake():
+    subtitles = SubtitleService()
+    context = ContextService()
+    context.add_term("Qwen")
+    command = parse_command("Correct QEMU in the last sentence.")
+    sub = subtitles.add("I am using QEMU.")
+    sub.finalize()
+
+    captured: dict = {}
+
+    async def _capture(self, *args, **kwargs):
+        payload = self._payload(sub, command, context, subtitles)
+        captured["instructions"] = payload["instructions"]
+        captured["project_vocabulary"] = payload["project_vocabulary"]
+        return SubtitleCorrection(
+            outcome=CorrectionOutcome.NO_CHANGE,
+            backend="llm",
+            reason="captured",
+        )
+
+    with patch.object(LLMCorrector, "correct_subtitle", _capture):
+        await build(subtitles, context, backend="llm").correct(command)
+
+    assert captured["instructions"]["user_named_term"] == "QEMU"
+    assert "Qwen" in captured["project_vocabulary"]
+
+
+def test_the_prompt_tells_the_model_to_compare_a_named_mistake_with_vocabulary():
+    prompt = correction_service.SYSTEM_PROMPT
+    assert "compare it against project_vocabulary" in prompt
+    assert "edit distance" in prompt
+    assert "do not replace merely because two terms look vaguely similar" in prompt
+    assert "return no_action" in prompt
+
+
+async def test_a_named_technical_term_is_corrected_to_a_vocabulary_equivalent():
+    """QEMU is a legitimate term, but with Qwen in vocabulary the model should
+    infer it when the user explicitly names QEMU as the mistake."""
+    subtitles = SubtitleService()
+    context = ContextService()
+    context.add_term("Qwen")
+    service = build(subtitles, context, backend="llm")
+    filler = subtitles.add("Unrelated line that must stay put.")
+    filler.finalize()
+    sub = subtitles.add("I am using QEMU.")
+    sub.finalize()
+
+    model_says = (
+        '{"action": "correct_subtitle", "target_subtitle_id": "' + sub.id + '", '
+        '"replacement_text": "I am using Qwen.", "vocabulary_term": null, '
+        '"reason": "user named QEMU; Qwen is the close vocabulary match"}'
+    )
+    with patch("httpx.AsyncClient.post", return_value=_llm_response(model_says)) as post:
+        result = await service.correct(parse_command("Correct QEMU in the last sentence."))
+
+    assert post.call_count == 1
+    assert result.outcome is CorrectionOutcome.APPLIED
+    assert result.backend == "llm"
+    # The child carries the corrected wording; the original is untouched, and
+    # only the named word changed - the surrounding sentence is preserved.
+    assert_corrected_as_child(subtitles, sub.id, "I am using QEMU.", "I am using Qwen.")
+    assert subtitles.get(filler.id).text == "Unrelated line that must stay put."
+
+
+def test_no_mapping_for_specific_terms_is_hard_coded():
+    """The generalisation must not smuggle in example pairs."""
+    prompt = correction_service.SYSTEM_PROMPT
+    for token in ("QEMU", "Qwen", "Quen", "Symfpony", "Symphony"):
+        assert token not in prompt, f"prompt hard-codes {token!r}"
+
+
+async def test_explicit_change_still_makes_zero_gateway_calls():
+    """'Change QEMU to Qwen.' stays deterministic, no model consulted."""
+    subtitles = SubtitleService()
+    context = ContextService()
+    context.add_term("Qwen")
+    service = build(subtitles, context, backend="llm")
+    sub = subtitles.add("I am using QEMU.")
+    sub.finalize()
+
+    with patch("httpx.AsyncClient.post", return_value=_llm_response("{}")) as post:
+        result = await service.correct(parse_command("Change QEMU to Qwen."))
+
+    assert post.call_count == 0
+    assert result.outcome is CorrectionOutcome.APPLIED
+    assert result.backend == "rules"
+    assert_corrected_as_child(subtitles, sub.id, "I am using QEMU.", "I am using Qwen.")
+
+
+async def test_a_named_mistake_without_a_candidate_declines_safely(context_with_fastapi):
+    """No plausible vocabulary candidate -> the model says no_action and nothing
+    is invented in its place."""
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi, backend="llm")
+    sub = subtitles.add("I am using some randomword here.")
+    sub.finalize()
+
+    declined = (
+        '{"action": "no_action", "target_subtitle_id": null, "replacement_text": null, '
+        '"vocabulary_term": null, "reason": "no strong vocabulary candidate for this word"}'
+    )
+    with patch("httpx.AsyncClient.post", return_value=_llm_response(declined)) as post:
+        result = await service.correct(parse_command("Correct randomword in the last sentence."))
+
+    assert post.call_count == 1
+    assert result.outcome is CorrectionOutcome.NO_ACTION
+    assert result.reason == "no strong vocabulary candidate for this word"
+    assert_uncorrected(subtitles, sub.id, "I am using some randomword here.")
