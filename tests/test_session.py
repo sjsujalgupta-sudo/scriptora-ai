@@ -1268,3 +1268,100 @@ async def test_ordinals_still_count_originals_after_two_corrections(stub):
         "Second, revised twice.",
     ]
     assert session.subtitles.get(second.id).text == "Second line."
+
+
+# ================ spoken "correct <term> in <line>" ========================
+# The voice gate is a list of fixed verb+target prefixes, and a command with a
+# word in the middle matched none of them: the instruction was spoken, cleared
+# the gate as ordinary dictation, and was left in the transcript as a subtitle.
+
+
+async def test_a_spoken_named_term_command_is_withdrawn_from_the_transcript(stub):
+    session, events = make_session()
+    await session.start()
+    sub = session.subtitles.add("Can you type Symfpony?")
+    sub.finalize()
+
+    with patch(
+        "httpx.AsyncClient.post", return_value=_gateway_says(sub.id, "Can you type Symphony?")
+    ):
+        await stub.last.emit_final("Correct Symfpony in the last sentence.")
+
+    removals = events_of(events, EventType.SUBTITLE_REMOVED)
+    assert removals, "the command line must be removed, not left on screen"
+    assert removals[-1]["payload"]["reason"] == "voice_command"
+    assert "Correct Symfpony" in removals[-1]["subtitle"]["text"]
+
+    # The instruction is gone from state; the spoken line it referred to is not.
+    texts = [s.text for s in session.subtitles]
+    assert not any("Correct Symfpony" in t for t in texts)
+    assert session.subtitles.get(sub.id).text == "Can you type Symfpony?"
+
+
+async def test_a_spoken_named_term_command_reaches_the_model(stub):
+    session, _events = make_session()
+    await session.start()
+    sub = session.subtitles.add("Can you type Symfpony?")
+    sub.finalize()
+
+    with patch(
+        "httpx.AsyncClient.post", return_value=_gateway_says(sub.id, "Can you type Symphony?")
+    ) as post:
+        await stub.last.emit_final("Correct Symfpony in the last sentence.")
+
+    assert post.call_count == 1, "the model decides the replacement, not the grammar"
+    assert corrected_text(session, sub.id) == "Can you type Symphony?"
+    assert session.subtitles.get(sub.id).text == "Can you type Symfpony?"
+
+
+async def test_a_named_term_command_shows_a_pending_state_while_the_model_thinks(stub):
+    session, events = make_session()
+    await session.start()
+    sub = session.subtitles.add("Can you type Symfpony?")
+    sub.finalize()
+
+    with patch(
+        "httpx.AsyncClient.post", return_value=_gateway_says(sub.id, "Can you type Symphony?")
+    ):
+        await stub.last.emit_final("Correct Symfpony in the last sentence.")
+
+    pending = events_of(events, EventType.CORRECTION_PENDING)
+    assert pending, "the user must see that the correction is still in flight"
+
+
+async def test_a_named_term_command_in_the_previous_line_targets_the_previous_line(stub):
+    session, _events = make_session()
+    await session.start()
+    first = session.subtitles.add("Can you type Symfpony?")
+    first.finalize()
+    second = session.subtitles.add("Moving on to the next topic.")
+    second.finalize()
+
+    with patch(
+        "httpx.AsyncClient.post", return_value=_gateway_says(first.id, "Can you type Symphony?")
+    ):
+        await stub.last.emit_final("Fix Symfpony in the previous sentence.")
+
+    assert corrected_text(session, first.id) == "Can you type Symphony?"
+    assert session.subtitles.get(second.id).text == "Moving on to the next topic."
+
+
+async def test_prose_mentioning_the_phrase_is_left_in_the_transcript(stub):
+    """The safety case: a report of having corrected something is dictation."""
+    session, _events = make_session()
+    await session.start()
+
+    spoken = "I corrected Symfpony yesterday in the last sentence of my report."
+    await stub.last.emit_final(spoken)
+
+    assert [s.text for s in session.subtitles] == [spoken]
+
+
+async def test_prose_about_fixing_something_is_left_in_the_transcript(stub):
+    session, _events = make_session()
+    await session.start()
+
+    spoken = "I need to fix the error in the last line of the report."
+    await stub.last.emit_final(spoken)
+
+    assert [s.text for s in session.subtitles] == [spoken]

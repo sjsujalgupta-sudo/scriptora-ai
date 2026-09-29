@@ -155,6 +155,26 @@ _VAGUE_FIND = frozenset(
     }
 )
 
+# "Correct the word in the last sentence." names a word but forgets which one.
+# The bare form of the grammar would otherwise read "the word" as the term and
+# pin the correction to a literal phrase that appears nowhere in the transcript.
+_TERM_MARKERS = frozenset(
+    {
+        "word",
+        "words",
+        "term",
+        "terms",
+        "phrase",
+        "bit",
+        "part",
+        "the word",
+        "the term",
+        "the phrase",
+        "the bit",
+        "the part",
+    }
+)
+
 
 def _strip_filler(text: str) -> str:
     previous = None
@@ -238,6 +258,72 @@ _SET_TEXT_FROM = re.compile(
 # A replacement the user quoted is authoritative: keep it byte for byte.
 _QUOTED = re.compile(r'^\s*[""\u201c\u2018\'](?P<inner>.+?)[""\u201d\u2019\']\s*$')
 
+# ---------------------------------------------------------------------------
+# "correct <term> in <target>" - the user pointing at one wrong word
+# ---------------------------------------------------------------------------
+# "Correct Symfpony in the last sentence." The rules above only match a verb
+# immediately followed by a target ("correct the last subtitle"), so a command
+# with a word in the middle fell through to "not a supported command" - and the
+# session gate never let it through either, leaving the spoken instruction
+# sitting in the transcript as though it were content.
+#
+# Deliberately a closed grammar, not an LLM parser: <target> is the same target
+# set every other command already uses, and <term> is a short run of word-like
+# tokens. Nothing here is specific to any particular mishearing.
+
+# One to three word-like tokens. Bounded so the lazy match stops at the first
+# "in <line noun>" instead of swallowing the rest of the sentence, and so a
+# paragraph cannot masquerade as a term.
+_TERM_TOKEN = r"\w[\w'&.+-]*"
+_TERM = rf"{_TERM_TOKEN}(?:\s+{_TERM_TOKEN}){{0,2}}"
+
+# What may follow the target: nothing, the command's own full stop, a
+# comma-separated aside, or a new sentence ("... in the last sentence. It should
+# be Symphony."). Requiring a capital after a mid-string full stop keeps "in the
+# last sentence of my report" from being read as a target. The capital check is
+# case-sensitive even though the pattern is not, hence the inline flag.
+_TERM_IN_TAIL = r"(?:\s*[,;:]\s*[\s\S]+|\s*[.!?]\s+(?-i:[A-Z])[\s\S]*|\s*[.!?]*)?$"
+
+# The marked form is matched first so "correct the word in the last sentence"
+# - a word named but forgotten - is not read as pointing at the literal word
+# "word". See `_TERM_MARKERS`.
+_CORRECT_TERM_IN = re.compile(
+    r"^(?:please\s+)?(?:correct|fix)\s+"
+    r"(?:the\s+)?(?:word|term|phrase|bit|part)\s+"
+    rf"(?P<term>{_TERM})\s+"
+    rf"in\s+(?P<target>{_TARGET})"
+    rf"{_TERM_IN_TAIL}",
+    re.IGNORECASE,
+)
+
+_CORRECT_TERM_IN_BARE = re.compile(
+    r"^(?:please\s+)?(?:correct|fix)\s+"
+    rf"(?P<term>{_TERM})\s+"
+    rf"in\s+(?P<target>{_TARGET})"
+    rf"{_TERM_IN_TAIL}",
+    re.IGNORECASE,
+)
+
+_CORRECT_TERM_IN_PATTERNS = (_CORRECT_TERM_IN, _CORRECT_TERM_IN_BARE)
+
+# Looser sibling of the two grammars above, and only ever used by the session's
+# command gate. The gate's job is to answer "was the speaker trying to issue a
+# command?", so it must also catch a malformed attempt like "correct the word
+# in the last sentence" - otherwise that utterance is left in the transcript as
+# though it were content. It reuses `_TARGET` rather than restating it, so the
+# gate and the parser cannot drift apart. The strict grammars still decide what
+# the phrase means; this only decides that it was aimed at a command.
+_COMMAND_SHAPE_IN_TARGET = re.compile(
+    rf"^(?:correct|fix)\b.*\bin\s+(?:{_TARGET}|{_LINE_NOUN})\b",
+    re.IGNORECASE,
+)
+
+
+def names_a_line_to_fix(text: str) -> bool:
+    """Whether `text` is shaped like "correct <something> in <line>"."""
+    return _COMMAND_SHAPE_IN_TARGET.match(text.strip()) is not None
+
+
 # Longest replacement accepted as "the new line". A dictated sentence is short;
 # anything longer is a paragraph, which a subtitle line is not.
 _MAX_REPLACEMENT = 240
@@ -295,6 +381,28 @@ def _parse_target(text: str) -> tuple[CorrectionTarget, int | None] | None:
     return None
 
 
+def _usable_term(term: str) -> str | None:
+    """Normalise and vet a word the user named, or None if it identifies nothing.
+
+    Returns None rather than a guess whenever the pointer is unusable, so the
+    command degrades to a plain correction of the line it named and the model
+    decides from context. Never invents a word.
+    """
+    cleaned = normalize_term(term).strip(" .?!,")
+    if not cleaned or len(cleaned) > _MAX_NAMED_TERM:
+        return None
+    if cleaned.casefold() in _VAGUE_FIND or cleaned.casefold() in _TERM_MARKERS:
+        return None
+    # "it should be the name of the framework" is someone explaining, not
+    # naming an answer.
+    if len(cleaned.split()) > _MAX_NAMED_TERM_WORDS:
+        return None
+    # Must contain something a lookup pattern can actually match.
+    if not any(char.isalnum() for char in cleaned):
+        return None
+    return cleaned
+
+
 def _named_term(text: str) -> str | None:
     """Pull the answer out of "...correct the last subtitle, it's FastAPI".
 
@@ -304,20 +412,7 @@ def _named_term(text: str) -> str | None:
     match = _NAMED_TERM.search(text)
     if not match:
         return None
-
-    term = normalize_term(match.group("term")).strip(" .?!,")
-    if not term or len(term) > _MAX_NAMED_TERM:
-        return None
-    if term.casefold() in _VAGUE_FIND:
-        return None
-    # "it should be the name of the framework" is someone explaining, not
-    # naming an answer.
-    if len(term.split()) > _MAX_NAMED_TERM_WORDS:
-        return None
-    # Must contain something a lookup pattern can actually match.
-    if not any(char.isalnum() for char in term):
-        return None
-    return term
+    return _usable_term(match.group("term"))
 
 
 def needs_model(command: ParsedCommand) -> bool:
@@ -401,6 +496,47 @@ def parse_command(command: str) -> ParsedCommand:
             target=target,
             ordinal=ordinal,
             reason=f'Setting {phrasing} to "{replacement}"{stop}',
+        )
+
+    # "correct Symfpony in the last sentence" is checked before the bare
+    # "correct the last subtitle" rules because it is strictly more specific:
+    # it requires a target phrase *and* a named word. A bare "fix the last
+    # subtitle" still falls through to `_PREVIOUS`/`_LAST` untouched.
+    for pattern in _CORRECT_TERM_IN_PATTERNS:
+        match = pattern.match(verbatim)
+        if not match:
+            continue
+        resolved = _parse_target(match.group("target"))
+        if resolved is None:
+            # "correct Symfpony in the sentence after this" names a line we
+            # cannot resolve. Refuse rather than default to the last line,
+            # which would silently rewrite the wrong subtitle.
+            return ParsedCommand(
+                CommandKind.UNSUPPORTED,
+                raw,
+                reason=(
+                    "I could not tell which line to fix. Try "
+                    '"correct the word in the last sentence" or '
+                    '"correct the word in sentence 3".'
+                ),
+            )
+        target, ordinal = resolved
+        # The word the user pointed at becomes `find` only. The replacement is
+        # still the model's to infer, so a mishearing can be repaired without
+        # this grammar ever knowing what it should have been.
+        find = _usable_term(match.group("term"))
+        phrasing = ParsedCommand(
+            CommandKind.CORRECT_LAST, raw, target=target, ordinal=ordinal
+        ).describe_target()
+        return ParsedCommand(
+            CommandKind.CORRECT_PREVIOUS
+            if target is CorrectionTarget.PREVIOUS
+            else CommandKind.CORRECT_LAST,
+            raw,
+            find=find,
+            target=target,
+            ordinal=ordinal,
+            reason=f'Fixing "{find}" in {phrasing}.' if find else f"Fixing {phrasing}.",
         )
 
     if _PREVIOUS.search(text):

@@ -57,6 +57,11 @@ SYSTEM_PROMPT = (
     "when it is NOT in project_vocabulary. Examples: 'Quen' becomes 'Qwen', "
     "'kubernetties' becomes 'Kubernetes'.\n\n"
     "Rules:\n"
+    "- user_named_term is the exact word or phrase the user pointed at. When the "
+    "command was 'correct X in the last sentence', X is the word they believe is "
+    "wrong: inspect it first. When the command ended '... it's X', X is the text "
+    "they believe is right: use that spelling. Either way, never change a named "
+    "term that already appears correctly.\n"
     "- Set target_subtitle_id to the id of the subtitle you were asked to fix. "
     "Use only an id present in the input. Never invent an id.\n"
     "- Change as few words as possible. Repair only the misheard word and leave "
@@ -158,6 +163,13 @@ class LLMCorrector:
                     if command.kind is CommandKind.REPLACE
                     else None
                 ),
+                # "Correct Symfpony in the last sentence." names the word the
+                # user believes is wrong. Passing it explicitly spares the model
+                # from re-parsing the utterance, and stays a hint: it may still
+                # answer no_action when the word turns out to be correct.
+                "user_named_term": command.find
+                if command.kind in (CommandKind.CORRECT_LAST, CommandKind.CORRECT_PREVIOUS)
+                else None,
                 "suggested_target_subtitle_id": target_id,
             },
         }

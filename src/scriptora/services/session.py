@@ -27,7 +27,13 @@ from ..models.correction import CorrectionAction, CorrectionOutcome, CorrectionR
 from ..models.events import EventType, ServerEvent
 from ..models.subtitle import Subtitle
 from .assemblyai_service import AssemblyAIRealtimeService
-from .command_service import CommandKind, ParsedCommand, needs_model, parse_command
+from .command_service import (
+    CommandKind,
+    ParsedCommand,
+    names_a_line_to_fix,
+    needs_model,
+    parse_command,
+)
 from .context_service import ContextService
 from .correction_service import CorrectionService
 from .subtitle_service import SubtitleService
@@ -412,7 +418,7 @@ class ScriptoraSession:
         lowered = _LEADING_POLITENESS.sub("", turn_text.strip().lower())
         if not any(
             lowered.startswith(prefix) for _kind, prefixes in _COMMANDS for prefix in prefixes
-        ):
+        ) and not names_a_line_to_fix(lowered):
             return
 
         command = parse_command(turn_text)

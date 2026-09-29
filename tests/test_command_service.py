@@ -525,3 +525,197 @@ def test_the_new_punctuation_tolerance_cannot_shadow_a_find_replace():
     assert command.kind is CommandKind.REPLACE
     assert command.find == "fast API"
     assert command.replace == "FastAPI"
+
+
+# ==================== correct <term> in <target> ==========================
+# The user pointing at one wrong word, rather than asking for a whole line to
+# be revisited. Nothing here is specific to any particular mishearing, so the
+# arbitrary nonsense word in most of these cases is the point.
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Correct Symfpony in the last sentence.",
+        "Fix Symfpony in the last subtitle.",
+        "Correct the word Symfpony in the last sentence.",
+        "Fix the term Symfpony in the last subtitle.",
+        "Correct the phrase Symfpony in the last line.",
+    ],
+)
+def test_naming_a_word_in_the_last_line_captures_the_term(phrase):
+    command = parse_command(phrase)
+
+    assert command.kind is CommandKind.CORRECT_LAST
+    assert command.target is CorrectionTarget.LAST
+    assert command.find == "Symfpony"
+
+
+@pytest.mark.parametrize("noun", ["sentence", "subtitle", "line", "caption", "transcript"])
+def test_every_line_noun_the_project_already_uses_is_accepted(noun):
+    command = parse_command(f"Correct Symfpony in the last {noun}.")
+
+    assert command.kind is CommandKind.CORRECT_LAST
+    assert command.find == "Symfpony"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Correct Symfpony in the previous sentence.",
+        "Fix Symfpony in the previous subtitle.",
+        "Correct Symfpony in the prior line.",
+        "Fix Symfpony in the preceding caption.",
+    ],
+)
+def test_naming_a_word_in_the_previous_line_keeps_previous_semantics(phrase):
+    command = parse_command(phrase)
+
+    assert command.kind is CommandKind.CORRECT_PREVIOUS
+    assert command.target is CorrectionTarget.PREVIOUS
+    assert command.find == "Symfpony"
+
+
+@pytest.mark.parametrize(
+    "phrase,ordinal",
+    [
+        ("Correct Symfpony in sentence 3.", 3),
+        ("Fix Symfpony in sentence 3.", 3),
+        ("Correct Symfpony in the 3rd sentence.", 3),
+        ("Fix the word Symfpony in the 22nd line.", 22),
+    ],
+)
+def test_an_ordinal_target_is_resolved_not_defaulted_to_the_last_line(phrase, ordinal):
+    command = parse_command(phrase)
+
+    assert command.kind is CommandKind.CORRECT_LAST
+    assert command.target is CorrectionTarget.ORDINAL
+    assert command.ordinal == ordinal
+    assert command.find == "Symfpony"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Correct Symfpony in the last sentence",
+        "correct symfpony in the last sentence.",
+        "CORRECT SYMFPONY IN THE LAST SENTENCE.",
+        "Correct Symfpony in the last sentence!",
+        "Correct Symfpony in the last sentence, please.",
+        "Please correct Symfpony in the last sentence.",
+        "Please fix Symfpony in the last sentence, thanks.",
+    ],
+)
+def test_punctuation_case_and_politeness_variants_parse_identically(phrase):
+    command = parse_command(phrase)
+
+    assert command.kind is CommandKind.CORRECT_LAST
+    assert command.find.casefold() == "symfpony"
+
+
+def test_a_multi_word_term_is_kept_whole():
+    command = parse_command("Correct Kubernetes Cluster in the last sentence.")
+
+    assert command.kind is CommandKind.CORRECT_LAST
+    assert command.find == "Kubernetes Cluster"
+
+
+def test_a_trailing_named_answer_does_not_displace_the_pointed_at_word():
+    """The user can still say the answer; the pointer stays the primary term."""
+    command = parse_command("Correct Symfpony in the last sentence. It should be Symphony.")
+
+    assert command.kind is CommandKind.CORRECT_LAST
+    assert command.find == "Symfpony"
+
+
+def test_the_named_form_does_not_shadow_the_existing_verified_commands():
+    """The new grammar is more specific, so every older form must still win."""
+    assert parse_command("Correct the last subtitle.").kind is CommandKind.CORRECT_LAST
+    assert parse_command("Correct the last sentence.").kind is CommandKind.CORRECT_LAST
+    assert parse_command("Fix the previous subtitle.").kind is CommandKind.CORRECT_PREVIOUS
+
+    rewrite = parse_command("Change the last sentence to we deployed it.")
+    assert rewrite.kind is CommandKind.SET_TEXT
+    assert rewrite.replace == "we deployed it."
+
+
+def test_the_named_form_never_invents_a_replacement():
+    """Naming the mistake is not naming the answer; the model still decides."""
+    command = parse_command("Correct Symfpony in the last sentence.")
+
+    assert command.find == "Symfpony"
+    assert command.replace is None
+
+
+# ------------------------------------------------------------- negative cases
+
+
+def test_ordinary_prose_mentioning_the_phrase_is_not_a_command():
+    """A past-tense report of having corrected something is not an instruction."""
+    command = parse_command("I corrected Symfpony yesterday in the last sentence of my report.")
+
+    assert command.kind is CommandKind.UNSUPPORTED
+    assert command.is_supported is False
+
+
+def test_prose_that_does_not_begin_with_the_verb_is_not_a_command():
+    command = parse_command("I need to fix the error in the last line of the report.")
+
+    assert command.is_supported is False
+
+
+def test_a_vague_term_yields_no_find_so_nothing_is_invented():
+    """`something` cannot identify a word, so the command carries no pointer."""
+    command = parse_command("Correct something in the last sentence.")
+
+    assert command.kind is CommandKind.CORRECT_LAST
+    assert command.find is None
+
+
+def test_the_word_marker_alone_is_not_treated_as_the_term():
+    """A word named but forgotten must not pin the correction to the word "word"."""
+    command = parse_command("Correct the word in the last sentence.")
+
+    assert command.kind is CommandKind.CORRECT_LAST
+    assert command.find is None
+
+
+def test_an_empty_term_is_not_a_command():
+    command = parse_command("Correct in the last sentence.")
+
+    assert command.is_supported is False
+
+
+def test_an_oversized_term_is_not_a_command():
+    """A paragraph is someone explaining, not naming a word."""
+    command = parse_command(
+        "Correct the entire paragraph that I dictated earlier today in the last sentence."
+    )
+
+    assert command.is_supported is False
+
+
+def test_an_unresolvable_target_is_refused_rather_than_guessed():
+    """Defaulting to the last line here would rewrite the wrong subtitle."""
+    command = parse_command("Correct Symfpony in the sentence after this.")
+
+    # Refused outright: the target grammar has no "after this", so the command
+    # must not quietly become a correction of the newest line.
+    assert command.is_supported is False
+    assert command.kind is CommandKind.UNSUPPORTED
+    assert command.replace is None
+
+
+def test_a_target_followed_by_a_preposition_is_not_read_as_a_target():
+    command = parse_command("Correct Symfpony in the last sentence of my report.")
+
+    assert command.is_supported is False
+
+
+def test_the_grammar_is_generic_over_the_word_being_corrected():
+    """No mishearing is special-cased: the term is simply whatever was named."""
+    for word in ("Wobble", "Kubernete", "Quen", "Zorblax", "AT&T"):
+        command = parse_command(f"Correct {word} in the last sentence.")
+
+        assert command.kind is CommandKind.CORRECT_LAST
+        assert command.find == word

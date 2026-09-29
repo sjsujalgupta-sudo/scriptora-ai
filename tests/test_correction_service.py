@@ -22,7 +22,7 @@ from scriptora.models.correction import (
     extract_json_object,
 )
 from scriptora.services import correction_service
-from scriptora.services.command_service import parse_command
+from scriptora.services.command_service import CommandKind, parse_command
 from scriptora.services.context_service import ContextService
 from scriptora.services.correction_service import CorrectionService, LLMCorrector
 from scriptora.services.subtitle_service import SubtitleService
@@ -1097,3 +1097,140 @@ async def test_a_quoted_set_text_target_works_end_to_end(context_with_fastapi):
 
     assert result.outcome is CorrectionOutcome.APPLIED
     assert_corrected_as_child(subtitles, third.id, "we should changed the config", "To deployed.")
+
+
+# ================= correct <term> in <target>, end to end ==================
+# Proves the term the user pointed at actually reaches the correction pipeline
+# and that repairing it needs no hard-coded knowledge of the word pair.
+
+
+async def test_the_named_term_reaches_the_model_as_a_hint():
+    """`find` must be handed to the LLM, which cannot otherwise see the pointer."""
+    subtitles = SubtitleService()
+    context = ContextService()
+    command = parse_command("Correct Symfpony in the last sentence.")
+    sub = subtitles.add("Can you type Symfpony?")
+    sub.finalize()
+
+    captured: dict = {}
+
+    async def _capture(self, *args, **kwargs):
+        payload = self._payload(sub, command, context, subtitles)
+        captured.update(payload["instructions"])
+        return SubtitleCorrection(
+            outcome=CorrectionOutcome.NO_CHANGE,
+            backend="llm",
+            reason="captured",
+        )
+
+    with patch.object(LLMCorrector, "correct_subtitle", _capture):
+        await build(subtitles, context, backend="llm").correct(command)
+
+    assert captured["user_named_term"] == "Symfpony"
+    assert captured["suggested_target_subtitle_id"] == sub.id
+
+
+async def test_the_named_term_is_not_sent_as_an_explicit_edit():
+    """A named mistake is a hint, never an instruction to substitute it."""
+    command = parse_command("Correct Symfpony in the last sentence.")
+
+    assert command.kind is CommandKind.CORRECT_LAST
+    assert command.replace is None
+
+
+async def test_a_model_backed_correction_can_change_only_the_named_word():
+    subtitles = SubtitleService()
+    context = ContextService()
+    service = build(subtitles, context, backend="llm")
+    sub = subtitles.add("Can you type Symfpony?")
+    sub.finalize()
+
+    good = (
+        '{"action": "correct_subtitle", "target_subtitle_id": "' + sub.id + '", '
+        '"replacement_text": "Can you type Symphony?", '
+        '"vocabulary_term": null, "reason": "clear mishearing"}'
+    )
+    with patch("httpx.AsyncClient.post", return_value=_llm_response(good)):
+        result = await service.correct(parse_command("Correct Symfpony in the last sentence."))
+
+    assert result.outcome is CorrectionOutcome.APPLIED
+    assert result.backend == "llm"
+    assert_corrected_as_child(subtitles, sub.id, "Can you type Symfpony?", "Can you type Symphony?")
+
+
+async def test_naming_a_word_alone_never_lets_the_rules_engine_invent_a_fix():
+    """The deterministic backend has no opinion about an unknown word."""
+    subtitles = SubtitleService()
+    context = ContextService()
+    service = build(subtitles, context, backend="rules")
+    sub = subtitles.add("Can you type Symfpony?")
+    sub.finalize()
+
+    result = await service.correct(parse_command("Correct Symfpony in the last sentence."))
+
+    # Either it declines or it passes the line through unchanged; what it must
+    # never do is substitute a word of its own invention.
+    assert result.backend == "rules"
+    assert_uncorrected(subtitles, sub.id, "Can you type Symfpony?")
+
+
+async def test_a_named_term_in_the_previous_line_corrects_the_previous_line():
+    subtitles = SubtitleService()
+    context = ContextService()
+    service = build(subtitles, context, backend="llm")
+    first = subtitles.add("Can you type Symfpony?")
+    first.finalize()
+    second = subtitles.add("Moving on to the next topic.")
+    second.finalize()
+
+    good = (
+        '{"action": "correct_subtitle", "target_subtitle_id": "' + first.id + '", '
+        '"replacement_text": "Can you type Symphony?", '
+        '"vocabulary_term": null, "reason": "clear mishearing"}'
+    )
+    with patch("httpx.AsyncClient.post", return_value=_llm_response(good)):
+        result = await service.correct(parse_command("Correct Symfpony in the previous sentence."))
+
+    assert result.outcome is CorrectionOutcome.APPLIED
+    assert_corrected_as_child(
+        subtitles, first.id, "Can you type Symfpony?", "Can you type Symphony?"
+    )
+    assert subtitles.get(second.id).text == "Moving on to the next topic."
+
+
+async def test_a_named_term_with_an_ordinal_target_corrects_that_line():
+    subtitles = SubtitleService()
+    context = ContextService()
+    service = build(subtitles, context, backend="llm")
+    first = subtitles.add("First line of the demo.")
+    first.finalize()
+    second = subtitles.add("Second line of the demo.")
+    second.finalize()
+    third = subtitles.add("Can you type Symfpony?")
+    third.finalize()
+
+    good = (
+        '{"action": "correct_subtitle", "target_subtitle_id": "' + third.id + '", '
+        '"replacement_text": "Can you type Symphony?", '
+        '"vocabulary_term": null, "reason": "clear mishearing"}'
+    )
+    with patch("httpx.AsyncClient.post", return_value=_llm_response(good)):
+        result = await service.correct(parse_command("Correct Symfpony in sentence 3."))
+
+    assert result.outcome is CorrectionOutcome.APPLIED
+    # The target the model was pointed at is the third original, and no other
+    # line moved.
+    assert_corrected_as_child(
+        subtitles, third.id, "Can you type Symfpony?", "Can you type Symphony?"
+    )
+    assert subtitles.get(first.id).text == "First line of the demo."
+    assert subtitles.get(second.id).text == "Second line of the demo."
+
+
+def test_the_prompt_explains_the_two_meanings_of_a_named_term():
+    """The pointer is ambiguous across phrasings, so the model is told both."""
+    prompt = correction_service.SYSTEM_PROMPT
+
+    assert "user_named_term" in prompt
+    assert "believe is wrong" in prompt
+    assert "believe is right" in prompt
