@@ -64,6 +64,11 @@ class Settings:
     min_turn_silence: int = 320
     max_turn_silence: int = 1600
 
+    # Lower bound on an interpreter's confidence before a spoken repair is
+    # executed. Below it, or without one, the turn stays in the transcript as
+    # ordinary speech.
+    intent_confidence_threshold: float = 0.6
+
     @property
     def has_api_key(self) -> bool:
         return bool(self.assemblyai_api_key)
@@ -118,6 +123,17 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = _clean(os.getenv(name))
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(0.0, min(1.0, value))
+
+
 def load_settings() -> Settings:
     """Build settings from the environment, falling back to safe defaults."""
     speech_model = _clean(os.getenv("SCRIPTORA_SPEECH_MODEL")) or "universal-3-5-pro"
@@ -145,6 +161,7 @@ def load_settings() -> Settings:
         host=_clean(os.getenv("SCRIPTORA_HOST")) or "127.0.0.1",
         port=_int_env("SCRIPTORA_PORT", 8000),
         frame_duration_ms=frame_duration_ms,
+        intent_confidence_threshold=_float_env("SCRIPTORA_INTENT_CONFIDENCE", 0.6),
     )
 
 

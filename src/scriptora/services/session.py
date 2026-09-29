@@ -36,6 +36,7 @@ from .command_service import (
 )
 from .context_service import ContextService
 from .correction_service import CorrectionService
+from .intent_service import IntentInterpreter, command_from_intent, looks_like_repair
 from .subtitle_service import SubtitleService
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,11 @@ class ScriptoraSession:
         self.context = ContextService()
         self.corrections = CorrectionService(settings, self.subtitles, self.context)
         self._assemblyai = AssemblyAIRealtimeService(settings)
+        # The repair interpreter (JOB 1) is only worth having when the same
+        # gateway the corrector relies on is reachable. Without it, Stage B of
+        # the voice gate never fires and natural repairs are simply left in the
+        # transcript - which is honest, not an error.
+        self._intent = IntentInterpreter(settings) if settings.llm_enabled else None
 
         self.status = "idle"
         # Bounded: see `send_audio`. Sized as ~1 s of audio at the configured
@@ -419,6 +425,11 @@ class ScriptoraSession:
         if not any(
             lowered.startswith(prefix) for _kind, prefixes in _COMMANDS for prefix in prefixes
         ) and not names_a_line_to_fix(lowered):
+            # Stage B: the turn did not open with a command verb, but it may
+            # still be a repair in ordinary words ("No, I said Symphony."). Only
+            # the interpreter may decide that - in ordinary speech it stays a
+            # subtitle, in a confirmed repair it becomes a command.
+            await self._maybe_interpret_repair(turn_text)
             return
 
         command = parse_command(turn_text)
@@ -435,6 +446,56 @@ class ScriptoraSession:
         # transcript as though it were content is the worst possible reading of
         # it. `_run_command` answers UNSUPPORTED with a result and no model call,
         # so the user is told what happened instead of hearing nothing.
+        await self._withdraw_turn_line(turn_text)
+
+        await self._run_command(command)
+
+    async def _maybe_interpret_repair(self, turn_text: str) -> None:
+        """Stage B of the voice gate: ask the interpreter about a repair.
+
+        Runs only when Stage A declined. The cheap cue check keeps ordinary
+        dictation away from the gateway; the interpreter then has to confirm
+        the turn refers to the transcript, or the subtitle is left alone. The
+        utterance is withdrawn from the transcript only once a repair is
+        confirmed, never before - an ambiguous turn costs nothing but the
+        round trip.
+        """
+        if self._intent is None or not looks_like_repair(turn_text):
+            return
+
+        result = await self._intent.interpret(turn_text, self.subtitles, self.context)
+        logger.debug("Stage B interpreted %r as %s", turn_text, result)
+        if result is None or not result.is_repair:
+            return
+        if result.confidence < self._settings.intent_confidence_threshold:
+            logger.debug(
+                "Stage B declined %r: confidence %s below %s",
+                turn_text,
+                result.confidence,
+                self._settings.intent_confidence_threshold,
+            )
+            return
+
+        command = command_from_intent(result, turn_text)
+        logger.debug("Stage B mapped %r to %r", turn_text, command)
+        if command is None:
+            return
+
+        # Safety interlock: a replace needs a `find` that is actually in the
+        # transcript. The interpreter is told this, but it is checked here too,
+        # so a confident hallucination cannot withdraw a line and then fail.
+        # Unlike Stage A - where the speaker clearly issued a command - a Stage
+        # B miss means the turn was probably not a repair at all, so it is kept
+        # as content rather than announced as an error.
+        if command.kind is CommandKind.REPLACE and self.corrections.resolve(command) is None:
+            logger.debug("Stage B kept %r: replacement find did not resolve", turn_text)
+            return
+
+        await self._withdraw_turn_line(turn_text)
+        await self._run_command(command)
+
+    async def _withdraw_turn_line(self, turn_text: str) -> None:
+        """Drop the finalized turn from the transcript and the browser's view."""
         last = self.subtitles.last()
         if last is not None and last.text.strip() == turn_text.strip():
             self.subtitles.remove(last.id)
@@ -444,8 +505,6 @@ class ScriptoraSession:
                 subtitle=last,
                 payload={"reason": "voice_command"},
             )
-
-        await self._run_command(command)
 
     async def _publish_result(self, command: ParsedCommand, result: CorrectionResult) -> None:
         if result.outcome is CorrectionOutcome.APPLIED:

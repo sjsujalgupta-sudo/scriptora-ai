@@ -701,6 +701,27 @@ def _gateway_says(subtitle_id: str, replacement: str) -> httpx.Response:
     )
 
 
+def _intent_says(intent: dict) -> httpx.Response:
+    """A gateway envelope around a repair-plan reply."""
+    return httpx.Response(
+        200,
+        json={"choices": [{"message": {"content": json.dumps(intent)}, "finish_reason": "stop"}]},
+    )
+
+
+def _replace_repair(find: str, replacement: str, confidence: float = 0.9) -> httpx.Response:
+    return _intent_says(
+        {
+            "intent": "replace_text",
+            "target": "find_text",
+            "find": find,
+            "replacement": replacement,
+            "confidence": confidence,
+            "reason": "the user corrects the misheard term",
+        }
+    )
+
+
 async def test_a_typed_command_still_corrects_the_intended_subtitle(stub):
     """The HTTP command route must survive the async conversion intact.
 
@@ -1396,3 +1417,211 @@ async def test_prose_about_fixing_something_is_left_in_the_transcript(stub):
     await stub.last.emit_final(spoken)
 
     assert [s.text for s in session.subtitles] == [spoken]
+
+
+# ==================== repair interpreter (Stage B of the voice gate) ========
+#
+# "No, I said Symphony." does not open with a command verb, so Stage A leaves it
+# in the transcript. Stage B asks the interpreter; a confirmed repair becomes a
+# command executed by the same deterministic engine as any other REPLACE.
+
+
+async def test_a_natural_repair_replaces_the_misheard_word(stub):
+    session, events = make_session()
+    await session.start()
+    sub = session.subtitles.add("Can you type Senzani?")
+    sub.finalize()
+
+    with patch("httpx.AsyncClient.post", return_value=_replace_repair("Senzani", "Symphony")):
+        await stub.last.emit_final("No, I said Symphony.")
+
+    assert corrected_text(session, sub.id) == "Can you type Symphony?"
+    assert session.subtitles.get(sub.id).text == "Can you type Senzani?"
+    corrections = events_of(events, EventType.CORRECTION)
+    assert corrections and corrections[-1]["payload"]["backend"] == "rules"
+
+
+async def test_a_natural_repair_is_withdrawn_from_the_transcript(stub):
+    session, events = make_session()
+    await session.start()
+    session.subtitles.add("Can you type Senzani?").finalize()
+
+    with patch("httpx.AsyncClient.post", return_value=_replace_repair("Senzani", "Symphony")):
+        await stub.last.emit_final("That's supposed to be Symphony.")
+
+    removals = events_of(events, EventType.SUBTITLE_REMOVED)
+    assert removals, "the confirmed repair must be withdrawn from the transcript"
+    assert removals[-1]["payload"]["reason"] == "voice_command"
+    assert "supposed to be Symphony" not in " ".join(s.text for s in session.subtitles)
+
+
+async def test_an_interpreted_repair_shows_no_pending_state(stub):
+    """A repair that carries its own answer is executed, not contemplated, so
+    the spinner that guards real model corrections must stay quiet."""
+    session, events = make_session()
+    await session.start()
+    session.subtitles.add("Can you type Senzani?").finalize()
+
+    with patch("httpx.AsyncClient.post", return_value=_replace_repair("Senzani", "Symphony")):
+        await stub.last.emit_final("Use Symphony instead.")
+
+    assert not events_of(events, EventType.CORRECTION_PENDING)
+
+
+async def test_an_interpreted_repair_calls_only_the_interpreter(stub):
+    """One gateway call - the interpreter - and no second model consultation:
+    the correction itself is a deterministic replace."""
+    session, _events = make_session()
+    await session.start()
+    session.subtitles.add("Can you type Senzani?").finalize()
+
+    with patch(
+        "httpx.AsyncClient.post", return_value=_replace_repair("Senzani", "Symphony")
+    ) as post:
+        await stub.last.emit_final("The last one should say Symphony.")
+
+    assert post.call_count == 1
+
+
+async def test_a_cued_rejection_is_left_in_the_transcript(stub):
+    """'I actually said the meeting starts at five.' cues, but the interpreter
+    classifies it as ordinary speech, so it must survive on the transcript."""
+    session, events = make_session()
+    await session.start()
+
+    spoken = "I actually said the meeting starts at five."
+    with patch(
+        "httpx.AsyncClient.post", return_value=_intent_says({"intent": "none", "confidence": 0.2})
+    ):
+        await stub.last.emit_final(spoken)
+
+    assert [s.text for s in session.subtitles] == [spoken]
+    assert not events_of(events, EventType.SUBTITLE_REMOVED)
+
+
+async def test_a_negative_that_never_cues_never_calls_the_gateway(stub):
+    """Prose that merely contains ordinary verbs must not pay for an LLM call."""
+    session, _events = make_session()
+    await session.start()
+
+    with patch("httpx.AsyncClient.post") as post:
+        for spoken in (
+            "We should replace the battery tomorrow.",
+            "Please fix the slides before Friday.",
+        ):
+            await stub.last.emit_final(spoken)
+
+    assert post.call_count == 0
+    assert len(session.subtitles) == 2
+
+
+async def test_a_cued_but_ordinary_turn_is_rejected_by_the_interpreter(stub):
+    """'I meant ...' cues, but the interpreter (seeing no transcript support)
+    classifies it as ordinary speech, so the line survives."""
+    session, events = make_session()
+    await session.start()
+
+    spoken = "I meant to call John yesterday."
+    with patch(
+        "httpx.AsyncClient.post", return_value=_intent_says({"intent": "none", "confidence": 0.2})
+    ):
+        await stub.last.emit_final(spoken)
+
+    assert [s.text for s in session.subtitles] == [spoken]
+    assert not events_of(events, EventType.SUBTITLE_REMOVED)
+
+
+async def test_a_low_confidence_repair_is_left_in_the_transcript(stub):
+    session, events = make_session()
+    await session.start()
+    session.subtitles.add("Can you type Senzani?").finalize()
+
+    spoken = "No, I said Symphony."
+    with patch(
+        "httpx.AsyncClient.post",
+        return_value=_replace_repair("Senzani", "Symphony", confidence=0.3),
+    ):
+        await stub.last.emit_final(spoken)
+
+    assert any(s.text == spoken for s in session.subtitles), "low confidence must stay content"
+    assert not events_of(events, EventType.SUBTITLE_REMOVED)
+
+
+async def test_a_repair_whose_find_is_absent_is_left_in_the_transcript(stub):
+    """The interpreter is fallible: a confident `find` that matches nothing in
+    the transcript must not withdraw the line or run a doomed replace."""
+    session, events = make_session()
+    await session.start()
+    session.subtitles.add("Nothing relevant here.").finalize()
+
+    spoken = "No, I said Symphony."
+    with patch("httpx.AsyncClient.post", return_value=_replace_repair("Senzani", "Symphony")):
+        await stub.last.emit_final(spoken)
+
+    assert any(s.text == spoken for s in session.subtitles)
+    assert not events_of(events, EventType.SUBTITLE_REMOVED)
+
+
+async def test_interpreter_gateway_failure_leaves_the_turn_as_content(stub):
+    session, events = make_session()
+    await session.start()
+    session.subtitles.add("Can you type Senzani?").finalize()
+
+    spoken = "No, I said Symphony."
+    with patch("httpx.AsyncClient.post", side_effect=httpx.ConnectError("no route")):
+        await stub.last.emit_final(spoken)
+
+    assert any(s.text == spoken for s in session.subtitles)
+    assert not events_of(events, EventType.SUBTITLE_REMOVED)
+
+
+async def test_malformed_interpreter_output_leaves_the_turn_as_content(stub):
+    session, events = make_session()
+    await session.start()
+    session.subtitles.add("Can you type Senzani?").finalize()
+
+    spoken = "No, I said Symphony."
+    with patch("httpx.AsyncClient.post", return_value=_intent_says("I am not JSON.")):
+        await stub.last.emit_final(spoken)
+
+    assert any(s.text == spoken for s in session.subtitles)
+    assert not events_of(events, EventType.SUBTITLE_REMOVED)
+
+
+async def test_an_interpreted_correct_subtitle_reaches_the_correction_model(stub):
+    """A repair that points at a line without saying the answer ('fix that one')
+    maps to the existing CORRECT_LAST path and consults the correction LLM."""
+    session, _events = make_session()
+    await session.start()
+    sub = session.subtitles.add("Can you type Symfpony?")
+    sub.finalize()
+
+    responses = [
+        _intent_says(
+            {
+                "intent": "correct_subtitle",
+                "target": "last",
+                "find": None,
+                "confidence": 0.9,
+                "reason": "the user asks to fix the last line",
+            }
+        ),
+        _gateway_says(sub.id, "Can you type Symphony?"),
+    ]
+    with patch("httpx.AsyncClient.post", side_effect=responses) as post:
+        await stub.last.emit_final("Actually, fix the last one.")
+
+    assert post.call_count == 2, "interpreter + correction model"
+    assert corrected_text(session, sub.id) == "Can you type Symphony?"
+
+
+async def test_explicit_change_does_not_consult_the_intent_interpreter(stub):
+    """Stage A owns 'Change X to Y', so it must stay zero-LLM and bypass Stage B."""
+    session, _events = make_session()
+    await session.start()
+    session.subtitles.add("Can you type Senzani?").finalize()
+
+    with patch("httpx.AsyncClient.post") as post:
+        await stub.last.emit_final("Change Senzani to Symphony.")
+
+    assert post.call_count == 0, "a leading-verb command never reaches the gateway"
