@@ -58,7 +58,7 @@ _COMMANDS: tuple[tuple[CommandKind, tuple[str, ...]], ...] = (
             "correct it",
         ),
     ),
-    (CommandKind.REPLACE, ("change ", "replace ", "swap ")),
+    (CommandKind.REPLACE, ("change ", "replace ", "swap ", "substitute ")),
     # Natural "change this / sentence 3 to <text>" phrasing. The REPLACE row
     # above already covers "change " and "replace "; these add the verbs that
     # only ever mean a whole-line rewrite, so a dictated "rewrite the third

@@ -1106,6 +1106,37 @@ async def test_a_spoken_ordinal_command_targets_the_same_line_as_a_typed_one(stu
     assert corrected_text(session, third.id) == "Rewritten three."
 
 
+async def test_a_spoken_replace_finds_the_line_that_mentions_the_term(stub):
+    """The voice gate must route "change X to Y" through the same resolver as
+    the typed path, so it targets the line mentioning X, not the latest line.
+    """
+    session, events = make_session()
+    await session.start()
+    first = session.subtitles.add("Can you type Senzani?")
+    first.finalize()
+    last = session.subtitles.add("And now we move on.")
+    last.finalize()
+
+    await stub.last.emit_final("Change Senzani to Symphony.")
+
+    assert corrected_text(session, first.id) == "Can you type Symphony?"
+    assert session.subtitles.corrections_of(last.id) == []
+    assert session.subtitles.get(first.id).text == "Can you type Senzani?"
+    removals = events_of(events, EventType.SUBTITLE_REMOVED)
+    assert removals and removals[-1]["payload"]["reason"] == "voice_command"
+    assert "Change Senzani to Symphony" not in " ".join(s.text for s in session.subtitles)
+
+
+async def test_a_spoken_replace_reports_a_clear_no_match(stub):
+    session, _events = make_session()
+    await session.start()
+    session.subtitles.add("Nothing relevant here.").finalize()
+
+    await stub.last.emit_final("Change Senzani to Symphony.")
+
+    assert session.subtitles.corrections_of(session.subtitles.last_original().id) == []
+
+
 async def test_the_transcript_count_ignores_corrections(stub):
     """A correction is not a sentence the user spoke.
 

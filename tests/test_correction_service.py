@@ -200,6 +200,173 @@ async def test_rules_honours_an_explicit_replace(context_with_fastapi):
     )
 
 
+# ============================================================== find-based REPLACE
+# "Change X to Y" / "Replace X with Y" name the *source* term, not a line, so
+# the engine must find the newest ORIGINAL subtitle that mentions X rather than
+# blindly rewriting the last subtitle.
+
+
+async def test_replace_targets_the_newest_original_containing_the_term(context_with_fastapi):
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    first = subtitles.add("Can you type Senzani?")
+    first.finalize()
+    second = subtitles.add("And now we are doing the demo.")
+    second.finalize()
+
+    result = await service.correct(parse_command("Change Senzani to Symphony."))
+
+    assert result.outcome is CorrectionOutcome.APPLIED
+    assert result.subtitle_id == first.id
+    assert_corrected_as_child(
+        subtitles,
+        first.id,
+        "Can you type Senzani?",
+        "Can you type Symphony?",
+    )
+    # The line that does not mention the term is left completely untouched -
+    # the exact regression from the failed live demo.
+    assert_uncorrected(subtitles, second.id, "And now we are doing the demo.")
+
+
+async def test_replace_skips_newer_subtitles_without_the_term(context_with_fastapi):
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    first = subtitles.add("We use Atlas for search first.")
+    first.finalize()
+    middle = subtitles.add("Nothing about atlases here.")
+    middle.finalize()
+    last = subtitles.add("Closing remarks.")
+    last.finalize()
+
+    result = await service.correct(parse_command("Replace Atlas with FastAPI."))
+
+    assert result.subtitle_id == first.id
+    assert_corrected_as_child(
+        subtitles, first.id, "We use Atlas for search first.", "We use FastAPI for search first."
+    )
+    assert_uncorrected(subtitles, middle.id, "Nothing about atlases here.")
+    assert_uncorrected(subtitles, last.id, "Closing remarks.")
+
+
+async def test_replace_picks_the_most_recent_of_several_matching_originals(context_with_fastapi):
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    older = subtitles.add("Atlas is the old choice.")
+    older.finalize()
+    filler = subtitles.add("Moving on.")
+    filler.finalize()
+    newer = subtitles.add("Atlas is the current choice.")
+    newer.finalize()
+
+    result = await service.correct(parse_command("Change Atlas to Astra."))
+
+    assert result.subtitle_id == newer.id
+    assert_corrected_as_child(
+        subtitles, newer.id, "Atlas is the current choice.", "Astra is the current choice."
+    )
+    assert_uncorrected(subtitles, older.id, "Atlas is the old choice.")
+    assert_uncorrected(subtitles, filler.id, "Moving on.")
+
+
+async def test_replace_never_searches_correction_children(context_with_fastapi):
+    """Only what AssemblyAI heard can be corrected; a child is not an original.
+
+    The term lands in a corrected child but no original, so find-based
+    resolution must report it missing instead of rewriting an invented line.
+    """
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    first = subtitles.add("Something unrelated.")
+    first.finalize()
+    second = subtitles.add("Just moving on.")
+    second.finalize()
+    await service.correct(parse_command('Change sentence 1 to "Can you type Senzani?"'))
+
+    result = await service.correct(parse_command("Change Senzani to Symphony."))
+
+    assert result.outcome is CorrectionOutcome.INVALID
+    assert "couldn't find" in result.message.casefold()
+
+
+async def test_replace_returns_a_clear_no_match_when_the_term_is_absent(context_with_fastapi):
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    subtitles.add("Nothing relevant here.").finalize()
+
+    result = await service.correct(parse_command("Change Senzani to Symphony."))
+
+    assert result.outcome is CorrectionOutcome.INVALID
+    assert "Senzani" in result.message
+    assert "couldn't find" in result.message.casefold()
+    assert "No correction was needed" not in result.message
+
+
+async def test_replace_with_nothing_spoken_keeps_the_empty_message(context_with_fastapi):
+    service = build(SubtitleService(), context_with_fastapi)
+
+    result = await service.correct(parse_command("Change Senzani to Symphony."))
+
+    assert result.outcome is CorrectionOutcome.INVALID
+    assert "no subtitles" in result.message.lower()
+
+
+async def test_replace_keeps_the_replacement_verbatim(context_with_fastapi):
+    """The user's replacement text is authoritative, case included - so long as
+    the replacement is not a vocabulary term (those are canonicalised by
+    design; 'Atlas' -> 'atlas' is a deliberate no-op).
+    """
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    sub = subtitles.add("We picked Atlas for the search.")
+    sub.finalize()
+
+    await service.correct(parse_command("Replace Atlas with senzani"))
+
+    assert_corrected_as_child(
+        subtitles,
+        sub.id,
+        "We picked Atlas for the search.",
+        "We picked senzani for the search.",
+    )
+
+
+async def test_replace_matches_transcription_spacing_like_the_edit_does(context_with_fastapi):
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    subtitles.add("The old tool is fully deprecated.").finalize()
+    target = subtitles.add("FastAPI is the new stack.")
+    target.finalize()
+
+    result = await service.correct(parse_command("Change fast API to Postgres."))
+
+    assert result.subtitle_id == target.id
+    assert_corrected_as_child(
+        subtitles, target.id, "FastAPI is the new stack.", "Postgres is the new stack."
+    )
+
+
+async def test_an_explicit_line_target_overrides_the_found_term(context_with_fastapi):
+    """'Change the last sentence to X' is not a find; it names the line.
+
+    The replacement text happens to match an older line, so a naive find would
+    have picked the wrong one. The explicit LAST target must win and rewrite
+    only the newest line, byte for byte.
+    """
+    subtitles = SubtitleService()
+    service = build(subtitles, context_with_fastapi)
+    older = subtitles.add("We talked about To deployed.")
+    older.finalize()
+    newest = subtitles.add("The talk will now end.")
+    newest.finalize()
+
+    result = await service.correct(parse_command("Change the last sentence to Deployed."))
+
+    assert result.subtitle_id == newest.id
+    assert_corrected_as_child(subtitles, newest.id, "The talk will now end.", "Deployed.")
+    assert_uncorrected(subtitles, older.id, "We talked about To deployed.")
+
+
 async def test_rules_reports_no_change_when_nothing_is_wrong(context_with_fastapi):
     subtitles = SubtitleService()
     service = build(subtitles, context_with_fastapi)
@@ -447,11 +614,14 @@ async def test_explicit_replace_wins_over_llm_rewrite(context_with_fastapi):
     assert result.backend == "rules"
 
 
-async def test_replace_skips_the_llm_even_when_the_edit_is_impossible(context_with_fastapi):
-    """A replace whose target text is absent still costs no gateway call.
+async def test_replace_skips_the_llm_even_when_the_term_is_absent(context_with_fastapi):
+    """A replace whose source term is nowhere in the transcript still costs no
+    gateway call, and is reported as a not-found rather than a silent no-op.
 
-    The literal edit produced nothing, so the result is a no_action - the same
-    outcome the previous code produced after paying for a discarded answer.
+    Before find-based resolution, "change X to Y" targeted the last subtitle
+    blindly: when X was absent, the deterministic edit produced nothing and the
+    user was told "No correction was needed" - misleading when they asked to
+    change a word that was never transcribed.
     """
     subtitles = SubtitleService()
     service = build(subtitles, context_with_fastapi, backend="llm")
@@ -466,7 +636,8 @@ async def test_replace_skips_the_llm_even_when_the_edit_is_impossible(context_wi
         result = await service.correct(parse_command("Replace missing with present."))
 
     assert post.call_count == 0
-    assert result.outcome is CorrectionOutcome.NO_ACTION
+    assert result.outcome is CorrectionOutcome.INVALID
+    assert "couldn't find" in result.message.casefold()
     assert_uncorrected(subtitles, sub.id, "Nothing relevant here.")
 
 

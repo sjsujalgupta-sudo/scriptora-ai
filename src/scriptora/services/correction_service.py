@@ -357,6 +357,24 @@ class CorrectionService:
 
         target = self._resolve_target(command)
         if target is None:
+            # A generic "change X to Y" names what to find but no line, so
+            # "X not found anywhere" has a specific meaning: the user's source
+            # term is absent. Telling them to "speak first" or that "no
+            # correction was needed" would both be lies.
+            if command.kind is CommandKind.REPLACE:
+                if not self._subtitles.originals():
+                    return CorrectionResult.failure(
+                        CorrectionOutcome.INVALID,
+                        "There are no subtitles to correct yet. Speak first, then correct.",
+                        backend=self._static_backend,
+                        reason=command.reason,
+                    )
+                return CorrectionResult.failure(
+                    CorrectionOutcome.INVALID,
+                    f'I couldn\'t find "{command.find}" in the transcript.',
+                    backend=self._static_backend,
+                    reason=command.reason,
+                )
             # Distinguish "nothing spoken yet" from "you asked for a line that
             # does not exist" - the second is a targeting mistake, and telling
             # the user to speak first would be actively misleading.
@@ -484,6 +502,12 @@ class CorrectionService:
         correction can never be addressed as "the last sentence" or shift the
         meaning of "the third sentence".
         """
+        if command.kind is CommandKind.REPLACE:
+            # "Change Senzani to Symphony" names no line. The user does not mean
+            # "change the newest subtitle" - they mean "find the line that says
+            # Senzani and rewrite it". Search newest original first so the most
+            # recent mention of the term wins when it appears several times.
+            return self._find_target_original(command)
         if command.kind is CommandKind.CORRECT_PREVIOUS:
             return self._subtitles.previous_original()
         if command.kind is CommandKind.SET_TEXT and command.target is CorrectionTarget.ORDINAL:
@@ -495,3 +519,27 @@ class CorrectionService:
         # THIS and LAST both mean the newest line; the distinction exists for the
         # user's benefit, not to select a different subtitle.
         return self._subtitles.last_original()
+
+    def _find_target_original(self, command: ParsedCommand) -> Subtitle | None:
+        """The most recent original subtitle whose text contains `command.find`.
+
+        Uses the same lookup pattern as the replace edit itself, so
+        "Change fast API to FastAPI" resolves "fast API" even against
+        "FastAPI"/"fast  api". Correction children are deliberately excluded:
+        what the user heard is found only in the lines AssemblyAI produced.
+        """
+        find = command.find
+        if not find:
+            return self._subtitles.last_original()
+        try:
+            pattern = make_lookup_pattern(find)
+        except ValueError:
+            pattern = None
+        needle = find.casefold()
+        for subtitle in reversed(self._subtitles.originals()):
+            if pattern is not None:
+                if pattern.search(subtitle.text):
+                    return subtitle
+            elif needle in subtitle.text.casefold():
+                return subtitle
+        return None
