@@ -67,6 +67,15 @@
   var resampleCarry = 0;
   var pcmCarry = new Float32Array(0);
 
+  // Shutdown sequencing. Stop is a controlled flush: the audio block that is
+  // in flight inside the audio graph must be placed on the socket before the
+  // stop control, so the server drains it and AssemblyAI can finish the final
+  // turn. Destroying the graph in the click handler was discarding that block,
+  // which is how the last spoken sentence disappeared from the transcript.
+  var stopping = false;
+  var flushDone = false;
+  var stopFallbackTimer = null;
+
   // =====================================================================
   // Logging
   // =====================================================================
@@ -330,6 +339,15 @@
       offset += FRAME_SAMPLES;
     }
     pcmCarry = merged.slice(offset);
+
+    // A Stop requested while a block was in flight is honoured here, at the
+    // block boundary: this is the last captured block, so send any complete
+    // frames it produced, flush the pcmCarry tail, and only then send the stop
+    // control. That ordering is the fix - the stop control must never overtake
+    // audio that the microphone has already captured.
+    if (stopping && !flushDone) {
+      flushAndStop();
+    }
   }
 
   async function startCapture() {
@@ -386,6 +404,32 @@
     pcmCarry = new Float32Array(0);
     resampleCarry = 0;
     el.levelFill.style.width = "0%";
+  }
+
+  // Finish a stop at a clean audio boundary. Every complete frame produced so
+  // far is already on the socket (onAudioData sent each full frame as soon as
+  // it was stitched); the only remaining audio is the pcmCarry tail, which is
+  // under one frame and would otherwise be silently dropped. Pad it to a
+  // full-size frame - never send a short one, AssemblyAI rejects frames under
+  // 50 ms - then send the stop control AFTER the audio, and only then release
+  // the capture pipeline. The WebSocket stays open so the server's final
+  // subtitle and session_ended events still arrive.
+  function flushAndStop() {
+    if (flushDone) return;
+    flushDone = true;
+    if (stopFallbackTimer !== null) {
+      clearTimeout(stopFallbackTimer);
+      stopFallbackTimer = null;
+    }
+    if (pcmCarry.length > 0) {
+      var padded = new Float32Array(FRAME_SAMPLES);
+      padded.set(pcmCarry, 0);
+      sendFrame(floatTo16BitPCM(padded));
+    }
+    listening = false;
+    sendControl("stop");
+    setStatus("idle", "Stopping...");
+    stopCapture();
   }
 
   // =====================================================================
@@ -499,11 +543,19 @@
       case "error":
         logActivity(msg.message, "err");
         setStatus("error", "Error");
-        if (msg.payload && msg.payload.fatal) teardown();
+        if (msg.payload && msg.payload.fatal) {
+          teardown();
+          closeSocket();
+        }
         break;
 
       case "session_ended":
         logActivity(msg.message, null);
+        setStatus("idle", "Stopped");
+        // The final subtitle (if any) arrived before this event, so tearing the
+        // capture down and closing the socket can no longer lose transcript.
+        teardown();
+        closeSocket();
         break;
     }
   }
@@ -511,6 +563,19 @@
   // =====================================================================
   // Lifecycle
   // =====================================================================
+  // Close the socket only once the server's final events have arrived (or the
+  // session failed and there is nothing left to receive). Closing early is what
+  // would race the final subtitle; closing late just leaks an idle connection
+  // on the server until the next Start.
+  function closeSocket() {
+    if (!ws) return;
+    var socket = ws;
+    ws = null;
+    try {
+      if (socket.readyState === WebSocket.OPEN) socket.close(1000, "session closed");
+    } catch (e) { /* already closing */ }
+  }
+
   function teardown() {
     listening = false;
     stopCapture();
@@ -550,6 +615,12 @@
     }
 
     listening = true;
+    stopping = false;
+    flushDone = false;
+    if (stopFallbackTimer !== null) {
+      clearTimeout(stopFallbackTimer);
+      stopFallbackTimer = null;
+    }
     el.waveform.hidden = false;
     el.listen.classList.add("btn-live");
     el.listen.querySelector(".btn-label").textContent = "Listening...";
@@ -559,9 +630,24 @@
   });
 
   el.stop.addEventListener("click", function () {
-    sendControl("stop");
-    setStatus("idle", "Stopping...");
-    teardown();
+    if (stopping) return;
+    stopping = true;
+    if (!audio) {
+      // Nothing was ever captured, or capture already failed: there is no
+      // audio to flush. If a server session is live, end it; otherwise just
+      // restore the UI.
+      if (!listening) { teardown(); return; }
+      flushAndStop();
+      return;
+    }
+    // A ScriptProcessor block (~90 ms) is usually in flight when the button is
+    // clicked. Rather than destroying the graph immediately - which drops that
+    // block and the captured tail - let the next audio callback perform the
+    // flush at the block boundary. The fallback only fires if the AudioContext
+    // suspended at the exact moment Stop was pressed, and is bounded by the
+    // block cadence, not a stall: a suspended context is the one case where a
+    // final block can no longer be delivered at all.
+    stopFallbackTimer = setTimeout(flushAndStop, 600);
   });
 
   el.clearLog.addEventListener("click", function () {

@@ -222,6 +222,11 @@ class ScriptoraSession:
         of the session. Dropping the oldest frame keeps latency near the cap:
         during live speech the newest audio is the only audio that still matters.
         """
+        # Audio is accepted until the stop control arrives. The browser (see
+        # app.js flushAndStop) places its final audio before the stop control,
+        # and WebSocket delivery is ordered, so every frame that belongs to the
+        # last sentence is already captured here - and drained by stop(). This
+        # guard only drops frames that arrive after a genuine stop request.
         if not self._running:
             return
         try:

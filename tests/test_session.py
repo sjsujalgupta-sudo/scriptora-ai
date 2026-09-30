@@ -41,6 +41,9 @@ class StubAssemblyAI:
         # Raised through the on_error callback when disconnecting, to model a
         # server that closes the socket as we terminate.
         self.error_on_disconnect: str | None = None
+        # When set, `disconnect()` emits a final Turn first, modelling the SDK
+        # flushing the last utterance on terminate before the session ends.
+        self.final_on_disconnect: str | None = None
         self._handlers: dict = {}
 
     async def connect(
@@ -70,6 +73,11 @@ class StubAssemblyAI:
         return True
 
     async def disconnect(self) -> None:
+        # The streaming SDK terminates by flushing the last utterance as a final
+        # Turn and *then* closing the socket. `session.stop()` relies on that
+        # ordering: the final subtitle lands before SESSION_ENDED.
+        if self.final_on_disconnect is not None:
+            await self._handlers["final"](self.final_on_disconnect, None, None)
         self.disconnected = True
         self.connected = False
         if self.error_on_disconnect is not None:
@@ -417,6 +425,111 @@ async def test_a_stalled_socket_still_stops_cleanly(stub):
     assert events_of(events, EventType.SESSION_ENDED), "Stop never completed"
 
 
+async def test_stop_waits_for_the_stream_to_drain_before_disconnecting(stub):
+    """disconnect() must only happen after the frame generator is exhausted.
+
+    The SDK flushes the final Turn as the socket terminates, so the last words
+    depend on every queued frame reaching the stream before the shutdown.
+    """
+    session, _ = make_session(_fast_settings())
+    stream_done = asyncio.Event()
+
+    async def wrapped_stream(frames):
+        async for _ in frames:
+            pass
+        stream_done.set()
+
+    # The stub is created in __init__, which is why this can be installed before
+    # start() wires the real task up to `self._assemblyai.stream`.
+    stub.last.stream = wrapped_stream
+    await session.start()
+
+    for _ in range(25):
+        await session.send_audio(_frame(session._settings))
+
+    await session.stop()
+    assert stream_done.is_set(), "the stream task never drained during stop()"
+
+
+async def test_final_turn_is_emitted_before_session_ended(stub):
+    """The last utterance must land as a subtitle before SESSION_ENDED.
+
+    Structurally, disconnect() flushes the final Turn and SESSION_ENDED is only
+    emitted after disconnect() returns - so a final transcript event is always
+    possible. This pins that ordering so it cannot regress.
+    """
+    session, events = make_session(_fast_settings())
+    await session.start()
+    await stub.last.emit_final("hello", turn_order=0)
+    stub.last.final_on_disconnect = "the last words"
+    await session.stop()
+
+    subtitles = events_of(events, EventType.SUBTITLE)
+    ended = events_of(events, EventType.SESSION_ENDED)
+    assert subtitles and ended
+    assert subtitles[-1]["payload"]["partial"] is False
+    assert events.index(subtitles[-1]) < events.index(ended[0])
+
+
+async def test_short_trailing_frame_is_dropped_not_forwarded_as_invalid(stub):
+    """A partial trailing chunk must never reach AssemblyAI as a short frame.
+
+    The browser pads its pcmCarry to a full frame before sending, but if any
+    short trailing chunk slips through (e.g. an aborted capture), dropping it is
+    correct - AssemblyAI rejects sub-50 ms frames with a protocol error.
+    """
+    settings = _fast_settings()
+    session, _ = make_session(settings)
+    await session.start()
+
+    short = _frame(settings)[: settings.frame_bytes // 2]
+    await session.send_audio(short)
+    for _ in range(3):
+        await session.send_audio(_frame(settings))
+    await session.stop()
+
+    assert all(len(chunk) == settings.frame_bytes for chunk in stub.last.streams)
+
+
+async def test_empty_session_stops_cleanly_without_an_error(stub):
+    """Start -> Stop with no words is a quiet no-op, not an error."""
+    session, events = make_session(_fast_settings())
+    await session.start()
+    await session.stop()
+
+    assert events_of(events, EventType.ERROR) == []
+    assert events_of(events, EventType.SESSION_ENDED)
+    assert session.running is False
+    assert session.status == "idle"
+
+
+async def test_repeated_start_stop_cycles_are_healthy(stub):
+    """The controlled shutdown must be repeatable without leaking state."""
+    session, events = make_session(_fast_settings())
+    for _ in range(5):
+        await session.start()
+        await session.send_audio(_frame(session._settings))
+        await session.stop()
+        assert session.running is False
+        assert session.status == "idle"
+        assert session._stream_task is None
+
+    assert len(events_of(events, EventType.SESSION_ENDED)) == 5
+    assert stub.last.disconnected is True
+    assert not session._background_tasks
+
+
+async def test_many_buffered_frames_all_drain_on_stop(stub):
+    """A full packet backlog must still be forwarded before the socket closes."""
+    settings = _fast_settings()
+    session, _ = make_session(settings)
+    await session.start()
+    for _ in range(200):
+        await session.send_audio(_frame(settings))
+    await session.stop()
+    assert len(stub.last.streams) == 200
+
+
 async def test_error_raised_while_stopping_is_not_reported_to_the_user(stub):
     """A socket closing as we terminate it is expected, not a failure.
 
@@ -661,6 +774,86 @@ def test_the_typed_command_route_does_not_block_the_socket_read_loop(stub):
     assert captured == ['Change this to "X"'], "the command was not dispatched"
     # The term round trip completing at all proves the loop kept reading.
     assert "activity" in types, f"socket stalled behind the correction: {types}"
+
+
+def test_frames_before_stop_reach_the_models_and_a_late_frame_is_cut_off(stub):
+    """Final audio must sit on the socket before the stop control.
+
+    The fix (app.js flushAndStop) sends [.. audio ..] then the stop control.
+    WebSocket ordering then guarantees every pre-stop frame is queued - and
+    drained by stop() - while a frame arriving after the stop control is
+    silently discarded by the send_audio guard, not reported as an error.
+    """
+    app = create_app(Settings(assemblyai_api_key=FAKE_KEY))
+    with TestClient(app) as client, client.websocket_connect("/ws/audio") as ws:
+        ws.receive_json()  # hello
+        ws.send_json({"action": "start"})
+        for _ in range(3):
+            ws.receive_json()  # session_started, context, status
+
+        frame = b"\x00" * 3200
+        for _ in range(5):
+            ws.send_bytes(frame)
+        ws.send_json({"action": "stop"})
+        # Sent after the stop control was processed: must be dropped quietly.
+        ws.send_bytes(frame)
+
+        seen = []
+        for _ in range(10):
+            event = ws.receive_json()
+            seen.append(event["type"])
+            if event["type"] == "session_ended":
+                break
+
+    assert "session_ended" in seen, f"stop never finished: {seen}"
+    assert "error" not in seen, "a post-stop frame must not surface as an error"
+    # Every frame sent before the stop control reached AssemblyAI.
+    assert len(stub.last.streams) == 5
+    assert all(len(chunk) == 3200 for chunk in stub.last.streams)
+
+
+def test_a_correction_in_flight_finishes_while_the_session_stops(stub):
+    """A command dispatched just before Stop still completes.
+
+    `handle_command` runs as a background task and stop() only shuts down the
+    audio path, so a correction in flight must land before the session ends -
+    the user pressed Stop, not abandoned the session.
+    """
+    app = create_app(Settings(assemblyai_api_key=FAKE_KEY, corrector_backend="rules"))
+    captured: list = []
+
+    original = ScriptoraSession.handle_command
+
+    class SlowCorrection(ScriptoraSession):
+        async def handle_command(self, raw):
+            captured.append(raw)
+            for _ in range(20):
+                await asyncio.sleep(0)
+            return await original(self, raw)
+
+    with (
+        patch.object(ScriptoraSession, "handle_command", SlowCorrection.handle_command),
+        TestClient(app) as client,
+        client.websocket_connect("/ws/audio") as ws,
+    ):
+        ws.receive_json()  # hello
+        ws.send_json({"action": "start"})
+        for _ in range(3):
+            ws.receive_json()
+
+        ws.send_json({"action": "command", "text": 'Change this to "X"'})
+        ws.send_json({"action": "stop"})
+
+        seen = []
+        for _ in range(10):
+            event = ws.receive_json()
+            seen.append(event["type"])
+            if "correction" in seen and "session_ended" in seen:
+                break
+
+    assert captured == ['Change this to "X"']
+    assert "correction" in seen, f"the in-flight correction was swallowed: {seen}"
+    assert "session_ended" in seen
 
 
 async def asyncio_sleep():
